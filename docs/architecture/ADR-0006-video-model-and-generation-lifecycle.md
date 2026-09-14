@@ -23,6 +23,7 @@ Phase 5 introduces the video generation layer in VideoGen. Unlike text generatio
       async def get_operation_status(self, operation_id: str) -> VideoOperation: ...
       async def cancel_generation(self, operation_id: str) -> None: ...
   ```
+- **Cancellation Semantics**: `cancel_generation()` requests cancellation when supported by the provider; otherwise the adapter reports that cancellation is unsupported and the job remains subject to provider completion. The domain protocol does not pretend cancellation succeeded if the underlying provider lacks cancellation support.
 - Upstream agents (such as `StoryboardAgent`) have zero coupling to `VideoModel` or provider adapters.
 
 ### 2. Provider-Specific Duration Normalization Policy
@@ -46,7 +47,8 @@ Phase 5 introduces the video generation layer in VideoGen. Unlike text generatio
       ├── Definitively failed/cancelled  ──> Initiate new attempt according to policy
       └── None                           ──> Submit new provider operation
   ```
-- This guarantees that network timeouts or service restarts never trigger duplicate concurrent generations for the same shot.
+- This guarantees that network timeouts or service restarts within a session never trigger duplicate concurrent generations for the same shot.
+- **Process-Local Scope & Phase 7 Production Requirement**: The current Phase 5 idempotency registry is process-local (`dict[str, VideoJobRecord]`). This protects against duplicate generation within a single `VideoGenerationService` instance. In Phase 7 (Persistent Orchestration), job state and idempotency keys must be backed by a durable store (PostgreSQL as the authoritative source of truth with atomic claims) to ensure safety across worker restarts, multiple containers, and distributed environments.
 
 ### 4. Configurable Provider Adapter (VeoVideoModel)
 - [VeoVideoModel](file:///e:/ML%20Projects/videogen/app/models/veo.py) implements `VideoModel` against Google's official `google-genai` SDK (`client.aio.models.generate_videos` and `client.aio.operations.get`).
@@ -80,6 +82,8 @@ queued ──> submitted ──> processing ──> completed
 
 ## Consequences
 
-- **Cost Safety**: Stable logical idempotency prevents accidental double-billing when recovering from transient network interruptions.
+- **Cost Safety**: Stable logical idempotency prevents accidental double-billing when recovering from transient network interruptions within an execution session.
+- **Phase 6 Duration Reconciliation Boundary**: Phase 6 (Media Assembly / Editing), not Phase 5, owns the reconciliation between storyboard target durations and actual Veo clip durations via trimming, concatenation, or speed adjustments.
+- **Phase 7 Persistent Orchestration Requirement**: Multi-worker, multi-container deployments will move the in-memory idempotency registry into durable PostgreSQL tables with atomic claims.
 - **Provider Interchangeability**: Replacing or augmenting Veo with another video diffusion engine requires only an adapter implementing `VideoModel`, leaving storyboard contracts and downstream assembly intact.
 - **Traceability**: Every video shot artifact is uniquely linked back to its storyboard shot, script scene, and narrative beat.

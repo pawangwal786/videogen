@@ -248,10 +248,17 @@ class VeoVideoModel(VideoModel):
         self,
         operation_id: str,
     ) -> None:
-        """Attempt to cancel an active video generation operation."""
-        logger.info("model.veo.cancel_requested", operation_id=operation_id)
-        # google-genai does not currently expose an explicit cancel endpoint on video operations;
-        # log notice for operational visibility.
+        """Attempt to cancel an active video generation operation.
+
+        Note: google-genai does not currently expose an explicit cancellation endpoint
+        for video generation operations. The adapter logs an operational warning indicating
+        cancellation is unsupported, and the job remains subject to provider completion.
+        """
+        logger.warning(
+            "model.veo.cancel_unsupported",
+            operation_id=operation_id,
+            detail="google-genai SDK does not expose a video operation cancellation endpoint; job remains subject to provider completion.",
+        )
 
     async def poll_until_complete(
         self,
