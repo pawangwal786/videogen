@@ -52,7 +52,7 @@ def build_storyboard_user_prompt(request: StoryboardRequest) -> str:
         lines.append(
             f"\n--- Scene {scene.scene_number} [{scene.beat_type}] (~{scene.estimated_duration_seconds}s) ---"
         )
-        lines.append(f"  Narration: \"{scene.narration}\"")
+        lines.append(f'  Narration: "{scene.narration}"')
         lines.append(f"  Visual Direction: {scene.visual_direction}")
         lines.append(f"  Keywords: {', '.join(scene.target_keywords)}")
 

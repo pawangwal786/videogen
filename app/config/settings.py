@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     # Gemini
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-2.5-flash"
+    veo_model: str = "veo-2.0-generate-001"
 
     # OpenRouter
     openrouter_api_key: SecretStr | None = None

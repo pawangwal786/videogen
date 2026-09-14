@@ -260,7 +260,9 @@ async def test_script_agent_lineage_missing_beat_raises_validation_error(
 ):
     # Omit scene 4 (beat 4 call_to_action)
     bad_payload = dict(valid_script_payload)
-    bad_payload["scenes"] = [s for s in valid_script_payload["scenes"] if s["narrative_beat_sequence"] != 4]
+    bad_payload["scenes"] = [
+        s for s in valid_script_payload["scenes"] if s["narrative_beat_sequence"] != 4
+    ]
 
     mock_text_model.generate.return_value = json.dumps(bad_payload)
     agent = ScriptAgent(model=mock_text_model)

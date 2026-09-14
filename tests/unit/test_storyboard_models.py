@@ -5,8 +5,6 @@ from pydantic import ValidationError
 
 from app.agents.script.models import ScriptResult, ScriptScene
 from app.agents.storyboard.models import (
-    DURATION_TOLERANCE_RATIO,
-    SCENE_DURATION_TOLERANCE_RATIO,
     StoryboardRequest,
     StoryboardResult,
     StoryboardShot,

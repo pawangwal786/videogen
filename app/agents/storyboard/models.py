@@ -199,7 +199,9 @@ def validate_shots_against_script(shots: list[StoryboardShot], script: ScriptRes
     # 3. Per-scene duration tolerance check (non-brittle float slack)
     for scene_num, scene in scene_map.items():
         scene_shots = [shot for shot in shots if shot.scene_number == scene_num]
-        scene_shots_duration = round(sum(shot.estimated_duration_seconds for shot in scene_shots), 2)
+        scene_shots_duration = round(
+            sum(shot.estimated_duration_seconds for shot in scene_shots), 2
+        )
         allowed_slack = max(
             1.5,
             round(scene.estimated_duration_seconds * SCENE_DURATION_TOLERANCE_RATIO, 2),

@@ -10,6 +10,14 @@ from app.models.errors import (
 from app.models.gemini import GeminiTextModel
 from app.models.openrouter import OpenRouterTextModel
 from app.models.router import ModelProvider, ModelRouter
+from app.models.veo import VeoVideoModel
+from app.models.video import (
+    VideoGenerationRequest,
+    VideoJobRecord,
+    VideoJobStatus,
+    VideoModel,
+    VideoOperation,
+)
 
 __all__ = [
     "GeminiTextModel",
@@ -23,4 +31,10 @@ __all__ = [
     "ModelTimeoutError",
     "OpenRouterTextModel",
     "TextModel",
+    "VeoVideoModel",
+    "VideoGenerationRequest",
+    "VideoJobRecord",
+    "VideoJobStatus",
+    "VideoModel",
+    "VideoOperation",
 ]

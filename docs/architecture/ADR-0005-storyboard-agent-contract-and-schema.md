@@ -48,8 +48,8 @@ Direct text-to-video generation without a structured storyboard phase leads to v
 
 ### 3. Centralized Duration Tolerance (Non-Brittle Decimal Arithmetic)
 To avoid brittle validation from floating-point rounding in LLM generation, duration validation employs two layers of tolerance:
-1. **Total Duration Tolerance**: The cumulative storyboard duration `estimated_duration_seconds` (sum of all shot durations) must fall within `target_duration_seconds ± 15%` (`DURATION_TOLERANCE_RATIO = 0.15`).
-2. **Per-Scene Duration Tolerance**: For each scene $s$, the sum of its constituent shot durations must align with `s.estimated_duration_seconds` within a defined margin (`SCENE_DURATION_TOLERANCE_RATIO = 0.25` or 1.5 seconds minimum slack).
+1. **Total Duration Tolerance (Authoritative Invariant)**: The cumulative storyboard duration `estimated_duration_seconds` (sum of all shot durations) must fall within `target_duration_seconds ± 15%` (`DURATION_TOLERANCE_RATIO = 0.15`). This is the authoritative timing invariant that governs the generated asset.
+2. **Per-Scene Duration Tolerance (Advisory Guidance)**: For each scene $s$, the sum of its constituent shot durations must align with `s.estimated_duration_seconds` within a defined margin (`SCENE_DURATION_TOLERANCE_RATIO = 0.25` or 1.5 seconds minimum slack). Per-scene duration allocation is advisory to allow the LLM creative pacing flexibility across shots while preventing wild timing drift, whereas the total storyboard duration is authoritative.
 
 ### 4. Structured Shot Framing and Camera Movement
 To ensure cinematic rigor and prevent arbitrary prompt phrasing, shot composition uses standardized vocabulary:

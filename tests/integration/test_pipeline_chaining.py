@@ -237,5 +237,7 @@ async def test_end_to_end_research_script_storyboard_pipeline():
     assert covered_scenes == {1, 2, 3, 4}
 
     # Verify per-scene duration mapping
-    scene1_duration = sum(s.estimated_duration_seconds for s in storyboard_res.shots if s.scene_number == 1)
+    scene1_duration = sum(
+        s.estimated_duration_seconds for s in storyboard_res.shots if s.scene_number == 1
+    )
     assert scene1_duration == 15.0

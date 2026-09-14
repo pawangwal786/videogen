@@ -4,4 +4,3 @@ from app.agents.script.agent import ScriptAgent
 from app.agents.storyboard.agent import StoryboardAgent
 
 __all__ = ["Agent", "ResearchAgent", "ScriptAgent", "StoryboardAgent"]
-
