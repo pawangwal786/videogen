@@ -17,7 +17,7 @@ TERMINAL_VIDEO_STATUSES: frozenset[VideoJobStatus] = frozenset({"completed", "fa
 ACTIVE_VIDEO_STATUSES: frozenset[VideoJobStatus] = frozenset({"queued", "submitted", "processing"})
 
 VALID_TRANSITIONS: dict[VideoJobStatus, set[VideoJobStatus]] = {
-    "queued": {"submitted", "cancelled"},
+    "queued": {"submitted", "failed", "cancelled"},
     "submitted": {"processing", "completed", "failed", "cancelled"},
     "processing": {"completed", "failed", "cancelled"},
     "completed": set(),

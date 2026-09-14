@@ -133,3 +133,52 @@ async def test_gemini_timeout_error(mock_genai_client):
         await model.generate("Hello")
     assert exc_info.value.provider == "gemini"
     assert exc_info.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_gemini_bad_request_400_maps_to_configuration_error(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = genai_errors.ClientError(
+        400, "Invalid argument: model parameter out of range."
+    )
+    model = GeminiTextModel(api_key="valid-key", client=mock_genai_client)
+
+    with pytest.raises(ModelConfigurationError) as exc_info:
+        await model.generate("Hello")
+    assert exc_info.value.provider == "gemini"
+    assert "Invalid argument" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_gemini_server_error_500_maps_to_retryable_response_error(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = genai_errors.APIError(
+        500, "Internal backend failure."
+    )
+    model = GeminiTextModel(api_key="valid-key", client=mock_genai_client)
+
+    with pytest.raises(ModelResponseError) as exc_info:
+        await model.generate("Hello")
+    assert exc_info.value.provider == "gemini"
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_gemini_unmapped_api_error_maps_to_non_retryable_response_error(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = genai_errors.APIError(
+        404, "Not Found: requested resource does not exist."
+    )
+    model = GeminiTextModel(api_key="valid-key", client=mock_genai_client)
+
+    with pytest.raises(ModelResponseError) as exc_info:
+        await model.generate("Hello")
+    assert exc_info.value.provider == "gemini"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_gemini_unexpected_exception_maps_to_response_error(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = RuntimeError("Broken pipe")
+    model = GeminiTextModel(api_key="valid-key", client=mock_genai_client)
+
+    with pytest.raises(ModelResponseError) as exc_info:
+        await model.generate("Hello")
+    assert "Broken pipe" in str(exc_info.value)

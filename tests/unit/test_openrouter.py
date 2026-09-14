@@ -151,3 +151,46 @@ async def test_openrouter_server_error_retryable(mock_openai_client):
         await model.generate("Hello")
     assert exc_info.value.provider == "openrouter"
     assert exc_info.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_openrouter_empty_choices_raises(mock_openai_client):
+    mock_response = MagicMock(choices=[])
+    mock_openai_client.chat.completions.create.return_value = mock_response
+
+    model = OpenRouterTextModel(api_key="valid-key", client=mock_openai_client)
+
+    with pytest.raises(ModelResponseError) as exc_info:
+        await model.generate("Hello")
+    assert "no choices" in str(exc_info.value)
+    assert exc_info.value.provider == "openrouter"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_openrouter_generic_api_error_non_retryable(mock_openai_client):
+    from openai import APIError
+
+    fake_request = httpx.Request("POST", "https://openrouter.ai/api/v1")
+    mock_openai_client.chat.completions.create.side_effect = APIError(
+        "Unprocessable entity", request=fake_request, body=None
+    )
+
+    model = OpenRouterTextModel(api_key="valid-key", client=mock_openai_client)
+
+    with pytest.raises(ModelResponseError) as exc_info:
+        await model.generate("Hello")
+    assert exc_info.value.provider == "openrouter"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_openrouter_unexpected_exception(mock_openai_client):
+    mock_openai_client.chat.completions.create.side_effect = RuntimeError("Kernel panic")
+
+    model = OpenRouterTextModel(api_key="valid-key", client=mock_openai_client)
+
+    with pytest.raises(ModelResponseError) as exc_info:
+        await model.generate("Hello")
+    assert "Kernel panic" in str(exc_info.value)
+    assert exc_info.value.provider == "openrouter"

@@ -221,3 +221,40 @@ async def test_research_agent_custom_system_prompt(mock_text_model, valid_resear
 
     await agent.run(request)
     assert mock_text_model.generate.await_args.kwargs["system_prompt"] == custom_prompt
+
+
+def test_build_research_user_prompt_with_optional_guidelines_and_aspects():
+    from app.agents.research.prompts import build_research_user_prompt
+
+    request = ResearchRequest(
+        workflow_id=uuid4(),
+        topic="Quantum Computing",
+        target_audience="Engineers",
+        target_duration_seconds=60,
+        research_depth="deep",
+        style_guidelines=["concise and rigorous", "use SI units"],
+        key_aspects_to_cover=["qubit coherence", "error correction"],
+    )
+    prompt = build_research_user_prompt(request)
+    assert "Topic: Quantum Computing" in prompt
+    assert "Style Guidelines:" in prompt
+    assert "- concise and rigorous" in prompt
+    assert "- use SI units" in prompt
+    assert "Key Aspects to Cover:" in prompt
+    assert "- qubit coherence" in prompt
+    assert "- error correction" in prompt
+
+
+@pytest.mark.asyncio
+async def test_base_agent_abstract_run_raises_not_implemented():
+    from app.agents.base import Agent
+
+    class ConcreteAgent(Agent[str, str]):
+        name = "test_agent"
+
+        async def run(self, input: str) -> str:
+            return await super().run(input)
+
+    agent = ConcreteAgent()
+    with pytest.raises(NotImplementedError):
+        await agent.run("test_input")

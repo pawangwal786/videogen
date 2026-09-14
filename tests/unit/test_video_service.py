@@ -227,3 +227,149 @@ async def test_generate_shot_provider_failure_raises(mock_video_model, sample_sh
     assert job is not None
     assert job.status == "failed"
     assert job.error_message == "Safety policy violation: unacceptable content."
+
+
+@pytest.mark.asyncio
+async def test_video_service_retry_after_failure(mock_video_model, sample_shot, tmp_path):
+    wf_id = uuid4()
+    service = VideoGenerationService(
+        video_model=mock_video_model,
+        staging_dir=tmp_path / "staging",
+        poll_interval_seconds=0.01,
+    )
+
+    # First attempt fails
+    mock_video_model.submit_generation.return_value = VideoOperation(
+        operation_id="ops/test-failed-1",
+        provider="veo",
+        status="submitted",
+        done=False,
+    )
+    mock_video_model.get_operation_status.return_value = VideoOperation(
+        operation_id="ops/test-failed-1",
+        provider="veo",
+        status="failed",
+        done=True,
+        error_message="Resource exhausted.",
+    )
+
+    with pytest.raises(ModelResponseError):
+        await service.generate_shot(sample_shot, wf_id, attempt=1)
+
+    failed_job = service.get_job(f"{wf_id}:shot:1")
+    assert failed_job.status == "failed"
+    assert failed_job.attempt == 1
+
+    # Second attempt (retry attempt=2) succeeds
+    mock_video_model.submit_generation.return_value = VideoOperation(
+        operation_id="ops/test-retry-2",
+        provider="veo",
+        status="submitted",
+        done=False,
+    )
+    mock_video_model.get_operation_status.return_value = VideoOperation(
+        operation_id="ops/test-retry-2",
+        provider="veo",
+        status="completed",
+        done=True,
+        video_bytes=b"retry_success_bytes",
+    )
+
+    record2 = await service.generate_shot(sample_shot, wf_id, attempt=2)
+    assert record2.status == "completed"
+    assert record2.attempt == 2
+    assert record2.operation_id == "ops/test-retry-2"
+    assert mock_video_model.submit_generation.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_video_service_submit_exception_fails_record(mock_video_model, sample_shot, tmp_path):
+    wf_id = uuid4()
+    mock_video_model.submit_generation.side_effect = RuntimeError("Connection dropped")
+
+    service = VideoGenerationService(
+        video_model=mock_video_model,
+        staging_dir=tmp_path / "staging",
+        poll_interval_seconds=0.01,
+    )
+
+    with pytest.raises(RuntimeError, match="Connection dropped"):
+        await service.generate_shot(sample_shot, wf_id)
+
+    job = service.get_job(f"{wf_id}:shot:1")
+    assert job is not None
+    assert job.status == "failed"
+    assert "Connection dropped" in job.error_message
+
+
+@pytest.mark.asyncio
+async def test_video_service_polling_timeout_raises(mock_video_model, sample_shot, tmp_path):
+    from app.models.errors import ModelTimeoutError
+
+    wf_id = uuid4()
+    mock_video_model.submit_generation.return_value = VideoOperation(
+        operation_id="ops/slow-op",
+        provider="veo",
+        status="submitted",
+        done=False,
+    )
+    # Never completes
+    mock_video_model.get_operation_status.return_value = VideoOperation(
+        operation_id="ops/slow-op",
+        provider="veo",
+        status="processing",
+        done=False,
+    )
+
+    service = VideoGenerationService(
+        video_model=mock_video_model,
+        staging_dir=tmp_path / "staging",
+        timeout_seconds=0.05,
+        poll_interval_seconds=0.01,
+    )
+
+    with pytest.raises(ModelTimeoutError) as exc_info:
+        await service.generate_shot(sample_shot, wf_id)
+
+    assert "timed out" in str(exc_info.value)
+    job = service.get_job(f"{wf_id}:shot:1")
+    assert job.status == "failed"
+    assert "timed out" in job.error_message
+
+
+@pytest.mark.asyncio
+async def test_video_service_transitions_to_processing_state(
+    mock_video_model, sample_shot, tmp_path
+):
+    wf_id = uuid4()
+    mock_video_model.submit_generation.return_value = VideoOperation(
+        operation_id="ops/progress-op",
+        provider="veo",
+        status="submitted",
+        done=False,
+    )
+
+    op_processing = VideoOperation(
+        operation_id="ops/progress-op",
+        provider="veo",
+        status="processing",
+        done=False,
+    )
+    op_completed = VideoOperation(
+        operation_id="ops/progress-op",
+        provider="veo",
+        status="completed",
+        done=True,
+        video_bytes=b"progress_bytes",
+    )
+    mock_video_model.get_operation_status.side_effect = [op_processing, op_completed]
+
+    service = VideoGenerationService(
+        video_model=mock_video_model,
+        staging_dir=tmp_path / "staging",
+        poll_interval_seconds=0.01,
+    )
+
+    record = await service.generate_shot(sample_shot, wf_id)
+    assert record.status == "completed"
+    assert mock_video_model.get_operation_status.await_count == 2

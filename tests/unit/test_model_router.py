@@ -162,3 +162,50 @@ def test_router_missing_primary_provider():
             primary=ModelProvider.GEMINI,
         )
     assert "Primary model provider" in str(exc_info.value)
+
+
+def test_router_missing_fallback_provider(mock_gemini):
+    with pytest.raises(ModelConfigurationError) as exc_info:
+        ModelRouter(
+            providers={ModelProvider.GEMINI: mock_gemini},
+            primary=ModelProvider.GEMINI,
+            fallback=ModelProvider.OPENROUTER,
+        )
+    assert "Fallback model provider" in str(exc_info.value)
+
+
+def test_router_from_settings_dual_providers():
+    from pydantic import SecretStr
+
+    from app.config.settings import Settings
+
+    settings = Settings(
+        gemini_api_key=SecretStr("fake-gemini-key"),
+        openrouter_api_key=SecretStr("fake-openrouter-key"),
+        videogen_primary_text_provider=ModelProvider.GEMINI,
+        videogen_fallback_text_provider=ModelProvider.OPENROUTER,
+    )
+
+    router = ModelRouter.from_settings(settings)
+    assert router.primary == ModelProvider.GEMINI
+    assert router.fallback == ModelProvider.OPENROUTER
+    assert ModelProvider.GEMINI in router._providers
+    assert ModelProvider.OPENROUTER in router._providers
+
+
+def test_router_from_settings_single_provider():
+    from pydantic import SecretStr
+
+    from app.config.settings import Settings
+
+    settings = Settings(
+        gemini_api_key=SecretStr("fake-gemini-key"),
+        videogen_primary_text_provider=ModelProvider.GEMINI,
+        videogen_fallback_text_provider=None,
+    )
+
+    router = ModelRouter.from_settings(settings)
+    assert router.primary == ModelProvider.GEMINI
+    assert router.fallback is None
+    assert ModelProvider.GEMINI in router._providers
+    assert ModelProvider.OPENROUTER not in router._providers
