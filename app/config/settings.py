@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.models.errors import ModelConfigurationError
@@ -56,6 +56,7 @@ class Settings(BaseSettings):
         "media_video_codec",
         "media_pixel_format",
         "media_audio_codec",
+        "database_url",
     )
     @classmethod
     def validate_non_whitespace_string(cls, v: str) -> str:
@@ -64,8 +65,44 @@ class Settings(BaseSettings):
             raise ValueError("Configuration string must not be empty or whitespace only")
         return s
 
+    # Database & Persistence
+    database_url: str = Field(
+        default="postgresql+asyncpg://postgres:postgres@localhost:5432/videogen",
+        min_length=1,
+        validation_alias=AliasChoices(
+            "VIDEOGEN_DATABASE_URL",
+            "DATABASE_URL",
+            "videogen_database_url",
+            "database_url",
+        ),
+    )
+    test_database_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "VIDEOGEN_TEST_DATABASE_URL",
+            "TEST_DATABASE_URL",
+            "videogen_test_database_url",
+            "test_database_url",
+        ),
+    )
+    database_pool_size: int = Field(default=5, ge=1)
+    database_max_overflow: int = Field(default=10, ge=0)
+    database_pool_timeout: float = Field(default=30.0, gt=0.0)
+    database_pool_recycle: int = Field(default=1800, ge=60)
+
+    # Orchestration & Worker Runtime
+    orchestrator_worker_lease_seconds: float = Field(default=60.0, gt=0.0)
+    orchestrator_heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
+    orchestrator_max_retries: int = Field(default=3, ge=0)
+
     # Integration testing safety
     videogen_run_external_tests: bool = False
+
+    def get_database_url(self, for_test: bool = False) -> str:
+        """Resolve the effective database URL, prioritizing test database URL if requested."""
+        if for_test:
+            return self.test_database_url or self.database_url
+        return self.database_url
 
     def require_gemini(self) -> str:
         """Validate and return the Gemini API key, or raise ModelConfigurationError."""

@@ -118,3 +118,51 @@ def test_media_settings_validation_errors():
 
     with pytest.raises(ValidationError, match="empty or whitespace only"):
         Settings(_env_file=None, media_video_codec="   ")
+
+
+def test_database_settings_defaults_and_methods():
+    settings = Settings(_env_file=None)
+    assert settings.database_url.startswith("postgresql+asyncpg://")
+    assert settings.test_database_url is None
+    assert settings.database_pool_size == 5
+    assert settings.database_max_overflow == 10
+    assert settings.database_pool_timeout == 30.0
+    assert settings.database_pool_recycle == 1800
+    assert settings.orchestrator_worker_lease_seconds == 60.0
+    assert settings.orchestrator_heartbeat_interval_seconds == 15.0
+    assert settings.orchestrator_max_retries == 3
+
+    # get_database_url without test url
+    assert settings.get_database_url(for_test=False) == settings.database_url
+    assert settings.get_database_url(for_test=True) == settings.database_url
+
+    # with test url
+    test_settings = Settings(
+        _env_file=None,
+        database_url="postgresql+asyncpg://user:pass@localhost:5432/main",
+        test_database_url="postgresql+asyncpg://user:pass@localhost:5432/test",
+    )
+    assert test_settings.get_database_url(for_test=False) == "postgresql+asyncpg://user:pass@localhost:5432/main"
+    assert test_settings.get_database_url(for_test=True) == "postgresql+asyncpg://user:pass@localhost:5432/test"
+
+
+def test_database_settings_validation_errors():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="database_url"):
+        Settings(_env_file=None, database_url="")
+
+    with pytest.raises(ValidationError, match="empty or whitespace only"):
+        Settings(_env_file=None, database_url="   ")
+
+    with pytest.raises(ValidationError, match="database_pool_size"):
+        Settings(_env_file=None, database_pool_size=0)
+
+    with pytest.raises(ValidationError, match="database_max_overflow"):
+        Settings(_env_file=None, database_max_overflow=-1)
+
+    with pytest.raises(ValidationError, match="database_pool_timeout"):
+        Settings(_env_file=None, database_pool_timeout=0.0)
+
+    with pytest.raises(ValidationError, match="database_pool_recycle"):
+        Settings(_env_file=None, database_pool_recycle=30)
