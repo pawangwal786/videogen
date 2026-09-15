@@ -93,3 +93,28 @@ def test_require_google_drive_missing():
     assert "GOOGLE_DRIVE_CLIENT_SECRET" in str(exc_info.value)
     assert "GOOGLE_DRIVE_REFRESH_TOKEN" in str(exc_info.value)
     assert "GOOGLE_DRIVE_ROOT_FOLDER_ID" in str(exc_info.value)
+
+
+def test_media_settings_validation_errors():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="media_max_concurrency"):
+        Settings(_env_file=None, media_max_concurrency=0)
+
+    with pytest.raises(ValidationError, match="media_assembly_timeout_seconds"):
+        Settings(_env_file=None, media_assembly_timeout_seconds=0.0)
+
+    with pytest.raises(ValidationError, match="media_assembly_timeout_seconds"):
+        Settings(_env_file=None, media_assembly_timeout_seconds=-10.0)
+
+    with pytest.raises(ValidationError, match="media_target_fps"):
+        Settings(_env_file=None, media_target_fps=0)
+
+    with pytest.raises(ValidationError, match="empty or whitespace only"):
+        Settings(_env_file=None, ffmpeg_binary="   ")
+
+    with pytest.raises(ValidationError, match="media_video_codec"):
+        Settings(_env_file=None, media_video_codec="")
+
+    with pytest.raises(ValidationError, match="empty or whitespace only"):
+        Settings(_env_file=None, media_video_codec="   ")

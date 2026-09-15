@@ -84,7 +84,6 @@ class AudioTrack(BaseModel):
 
     source_path: Path = Field(description="Local filesystem path to audio file")
     volume: float = Field(default=1.0, ge=0.0, le=2.0, description="Audio volume scale factor")
-    start_offset_seconds: float = Field(default=0.0, ge=0.0, description="Audio start offset")
     loop: bool = Field(
         default=True,
         description="If True, loop audio to match video duration; if False, play once and pad silence",

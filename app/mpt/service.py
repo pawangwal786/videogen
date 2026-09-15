@@ -7,7 +7,7 @@ from uuid import UUID
 
 from app.logging import get_logger
 from app.mpt.adapter import MediaProcessor
-from app.mpt.errors import MediaValidationError
+from app.mpt.errors import MediaConfigurationError, MediaValidationError
 from app.mpt.models import (
     MediaAssemblyRequest,
     MediaAssemblyResult,
@@ -30,6 +30,9 @@ class MediaAssemblyService:
         max_concurrency: int = 2,
         duration_tolerance_seconds: float = 0.5,
     ) -> None:
+        if max_concurrency < 1:
+            raise MediaConfigurationError("max_concurrency must be >= 1", operation="init")
+
         self.media_processor = media_processor
         self.storage = storage
         self.staging_dir = staging_dir or Path("tmp/staging")
@@ -67,9 +70,9 @@ class MediaAssemblyService:
             # 1. Resolve every clip to a verified, local readable path
             resolved_paths: dict[int, Path] = {}
             for clip in request.clips:
-                resolved_path = await self._resolve_clip_source(clip, workflow_id, input_dir)
-                if resolved_path != clip.source_path:
-                    downloaded_inputs.append(resolved_path)
+                resolved_path = await self._resolve_clip_source(
+                    clip, workflow_id, input_dir, downloaded_inputs
+                )
                 resolved_paths[clip.shot_number] = resolved_path
 
             # 2. Normalize all clips in parallel bounded by semaphore
@@ -153,29 +156,76 @@ class MediaAssemblyService:
         clip: MediaClip,
         workflow_id: UUID,
         input_dir: Path,
+        downloaded_inputs: list[Path],
     ) -> Path:
         """Ensure the source clip exists locally; download via storage if needed."""
+        local_path: Path
         if clip.source_path.exists() and clip.source_path.is_file():
-            return clip.source_path
-
-        # If local file is missing, attempt resolution via artifact_ref and storage
-        if clip.artifact_ref is not None and self.storage is not None:
+            local_path = clip.source_path
+        elif clip.artifact_ref is not None and self.storage is not None:
             input_dir.mkdir(parents=True, exist_ok=True)
-            local_target = input_dir / f"shot_{clip.shot_number}.mp4"
+            local_path = input_dir / f"shot_{clip.shot_number}.mp4"
             logger.info(
                 "mpt.assembly.download_artifact",
                 workflow_id=str(workflow_id),
                 shot_number=clip.shot_number,
                 artifact_id=str(clip.artifact_ref.id),
             )
-            await self.storage.download(clip.artifact_ref, local_target)
-            return local_target
+            await self.storage.download(clip.artifact_ref, local_path)
+            downloaded_inputs.append(local_path)
+        else:
+            raise MediaValidationError(
+                f"Clip file does not exist locally and cannot be resolved: {clip.source_path}",
+                workflow_id=workflow_id,
+                operation="resolve_source",
+            )
 
-        raise MediaValidationError(
-            f"Clip file does not exist locally and cannot be resolved: {clip.source_path}",
-            workflow_id=workflow_id,
-            operation="resolve_source",
-        )
+        # Enforce universal local media validation invariant
+        await self._validate_local_video(local_path, clip.shot_number, workflow_id)
+        return local_path
+
+    async def _validate_local_video(
+        self,
+        path: Path,
+        shot_number: int,
+        workflow_id: UUID,
+    ) -> None:
+        """Enforce strict invariant that a local video file exists, is non-empty, and has a probeable video stream."""
+        if not path.exists() or not path.is_file():
+            raise MediaValidationError(
+                f"Source media file for shot {shot_number} does not exist: {path}",
+                workflow_id=workflow_id,
+                operation="resolve_source",
+            )
+        try:
+            if path.stat().st_size == 0:
+                raise MediaValidationError(
+                    f"Source media file for shot {shot_number} is empty (0 bytes): {path}",
+                    workflow_id=workflow_id,
+                    operation="resolve_source",
+                )
+        except OSError as e:
+            raise MediaValidationError(
+                f"Cannot inspect media file for shot {shot_number}: {e}",
+                workflow_id=workflow_id,
+                operation="resolve_source",
+            ) from e
+
+        try:
+            probe_info = await self.media_processor.probe(path)
+        except Exception as e:
+            raise MediaValidationError(
+                f"Source media file for shot {shot_number} failed media probe validation: {e}",
+                workflow_id=workflow_id,
+                operation="resolve_source",
+            ) from e
+
+        if not probe_info.has_video:
+            raise MediaValidationError(
+                f"Source media file for shot {shot_number} contains no video stream: {path}",
+                workflow_id=workflow_id,
+                operation="resolve_source",
+            )
 
     @staticmethod
     def _cleanup_intermediates(

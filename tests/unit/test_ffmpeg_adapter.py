@@ -43,6 +43,14 @@ def test_ffmpeg_processor_init_missing_ffprobe():
             FFmpegMediaProcessor(ffmpeg_binary="ffmpeg", ffprobe_binary="ffprobe")
 
 
+def test_ffmpeg_processor_init_invalid_timeout(mock_binaries):
+    with pytest.raises(MediaConfigurationError, match="timeout_seconds must be > 0"):
+        FFmpegMediaProcessor(timeout_seconds=0.0)
+
+    with pytest.raises(MediaConfigurationError, match="timeout_seconds must be > 0"):
+        FFmpegMediaProcessor(timeout_seconds=-10.0)
+
+
 @pytest.mark.asyncio
 async def test_probe_success(mock_binaries, tmp_path):
     clip = tmp_path / "test.mp4"

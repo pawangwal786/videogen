@@ -30,7 +30,7 @@ Phase 6 requires an assembly layer that takes discrete video shot artifacts, nor
           self, video: Path, audio: AudioTrack, output: Path, video_duration: float
       ) -> MediaInfo: ...
   ```
-- **Boundary Invariant**: At the `MediaProcessor` boundary, every source media file must exist locally and be readable. `MediaProcessor` never interacts with cloud storage or resolves remote URIs.
+- **Boundary Invariant**: At the `MediaProcessor` boundary, every source media file must exist locally and be readable. `MediaProcessor` accepts only local filesystem paths. `MediaAssemblyService` is responsible for resolving `ArtifactRef` and validating the resulting local media (verifying existence, regular file, positive file size, and probeable video stream) before processor invocation. `MediaProcessor` never interacts with cloud storage or resolves remote URIs.
 - Application services (`MediaAssemblyService`, `VideoGenerationService`) do not construct FFmpeg command lines.
 
 ### 2. Concrete FFmpeg Media Processor (`FFmpegMediaProcessor`)
@@ -44,7 +44,7 @@ Phase 6 requires an assembly layer that takes discrete video shot artifacts, nor
 
 ### 3. Canonical Media Profile & Normalization Invariant
 - Before concatenation, all clips are normalized to a uniform profile derived from storyboard aspect ratio (`MediaProfile.from_aspect_ratio`):
-  - Aspect ratio: 9:16 (1080×1920), 16:9 (1920×1080), or 1:1 (1080×1080).
+  - Supported aspect ratios: `9:16` (1080×1920), `16:9` (1920×1080), `1:1` (1080×1080), `4:5` (1080×1350), and `2:3` (1080×1620).
   - Video codec: `libx264`, constant frame rate (30 fps), pixel format: `yuv420p`.
   - Filter: `scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p`.
   - Audio: Stripped during intermediate normalization (`-an`) so all clips are strictly video-only.
@@ -67,6 +67,7 @@ Phase 6 requires an assembly layer that takes discrete video shot artifacts, nor
   - **Longer Audio**: Audio is trimmed to the exact final video duration.
   - Volume is scaled via `-filter:a "volume={track.volume}"`.
   - Final output contains exactly one audio stream: AAC 44.1kHz stereo (`-c:a aac -b:a 192k -ar 44100 -ac 2`).
+- **Audio Timeline Scope**: Audio timeline alignment, seeking, and multi-track placement are deferred to Phase 7, where voiceover/music synchronization requirements will be specified and implemented as part of the audio timeline contract. In Phase 6, `AudioTrack` focuses strictly on full-video background audio integration (volume, looping, and silence padding).
 
 ### 6. Media Assembly Service & Workspace Isolation
 - `MediaAssemblyService` in `app.mpt.service.py`:

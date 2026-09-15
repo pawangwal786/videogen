@@ -35,6 +35,9 @@ class FFmpegMediaProcessor(MediaProcessor):
         ffprobe_binary: str = "ffprobe",
         timeout_seconds: float = 300.0,
     ) -> None:
+        if timeout_seconds <= 0.0:
+            raise MediaConfigurationError("timeout_seconds must be > 0", operation="init")
+
         self.ffmpeg_binary = ffmpeg_binary
         self.ffprobe_binary = ffprobe_binary
         self.timeout_seconds = timeout_seconds

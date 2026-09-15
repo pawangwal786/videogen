@@ -109,12 +109,10 @@ def test_audio_track_model():
     track = AudioTrack(
         source_path=audio_path,
         volume=0.8,
-        start_offset_seconds=1.5,
         loop=True,
     )
     assert track.source_path == audio_path
     assert track.volume == 0.8
-    assert track.start_offset_seconds == 1.5
     assert track.loop is True
 
     # Invalid volume

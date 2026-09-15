@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.models.errors import ModelConfigurationError
@@ -40,15 +40,29 @@ class Settings(BaseSettings):
     videogen_fallback_text_provider: ModelProvider | None = ModelProvider.OPENROUTER
 
     # Media Processing (FFmpeg / MPT)
-    ffmpeg_binary: str = "ffmpeg"
-    ffprobe_binary: str = "ffprobe"
-    media_max_concurrency: int = 2
-    media_assembly_timeout_seconds: float = 300.0
-    media_target_fps: int = 30
-    media_video_codec: str = "libx264"
-    media_pixel_format: str = "yuv420p"
-    media_audio_codec: str = "aac"
-    media_duration_tolerance_seconds: float = 0.5
+    ffmpeg_binary: str = Field(default="ffmpeg", min_length=1)
+    ffprobe_binary: str = Field(default="ffprobe", min_length=1)
+    media_max_concurrency: int = Field(default=2, ge=1)
+    media_assembly_timeout_seconds: float = Field(default=300.0, gt=0.0)
+    media_target_fps: int = Field(default=30, ge=1)
+    media_video_codec: str = Field(default="libx264", min_length=1)
+    media_pixel_format: str = Field(default="yuv420p", min_length=1)
+    media_audio_codec: str = Field(default="aac", min_length=1)
+    media_duration_tolerance_seconds: float = Field(default=0.5, ge=0.0)
+
+    @field_validator(
+        "ffmpeg_binary",
+        "ffprobe_binary",
+        "media_video_codec",
+        "media_pixel_format",
+        "media_audio_codec",
+    )
+    @classmethod
+    def validate_non_whitespace_string(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("Configuration string must not be empty or whitespace only")
+        return s
 
     # Integration testing safety
     videogen_run_external_tests: bool = False
