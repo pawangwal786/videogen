@@ -241,3 +241,187 @@ async def test_end_to_end_research_script_storyboard_pipeline():
         s.estimated_duration_seconds for s in storyboard_res.shots if s.scene_number == 1
     )
     assert scene1_duration == 15.0
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_video_generation_to_media_assembly(tmp_path):
+    """Verify chaining from StoryboardResult through VideoGenerationService to MediaAssemblyService."""
+    import shutil
+    import subprocess
+
+    from app.agents.storyboard.models import StoryboardResult, StoryboardShot
+    from app.models.video import VideoModel, VideoOperation
+    from app.mpt.ffmpeg import FFmpegMediaProcessor
+    from app.mpt.models import MediaAssemblyRequest, MediaClip, MediaProfile
+    from app.mpt.service import MediaAssemblyService
+    from app.video.service import VideoGenerationService
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("FFmpeg not available")
+
+    workflow_id = uuid4()
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate two real small video clips as provider output
+    clip1_bytes_path = raw_dir / "clip1.mp4"
+    clip2_bytes_path = raw_dir / "clip2.mp4"
+
+    import asyncio
+
+    await asyncio.to_thread(
+        subprocess.run,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=320x240:rate=30",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(clip1_bytes_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    await asyncio.to_thread(
+        subprocess.run,
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=320x240:rate=30",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(clip2_bytes_path),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    clip1_bytes = clip1_bytes_path.read_bytes()
+    clip2_bytes = clip2_bytes_path.read_bytes()
+
+    # 1. Storyboard with 3 shots (15s total)
+    storyboard = StoryboardResult(
+        workflow_id=workflow_id,
+        title="Pipeline Chaining Demo",
+        aspect_ratio="9:16",
+        visual_style="Cinematic",
+        target_duration_seconds=15,
+        estimated_duration_seconds=15.0,
+        total_shots=3,
+        shots=[
+            StoryboardShot(
+                shot_number=1,
+                scene_number=1,
+                shot_framing="wide_shot",
+                camera_movement="static",
+                visual_description="Shot 1 establishing scene.",
+                video_prompt="Futuristic city at sunset, 4k.",
+                estimated_duration_seconds=5.0,
+            ),
+            StoryboardShot(
+                shot_number=2,
+                scene_number=1,
+                shot_framing="close_up",
+                camera_movement="zoom_in",
+                visual_description="Shot 2 close up.",
+                video_prompt="Detailed view of quantum server racks.",
+                estimated_duration_seconds=5.0,
+            ),
+            StoryboardShot(
+                shot_number=3,
+                scene_number=2,
+                shot_framing="medium_shot",
+                camera_movement="tracking",
+                visual_description="Shot 3 tracking.",
+                video_prompt="Engineer inspecting holographic console.",
+                estimated_duration_seconds=5.0,
+            ),
+        ],
+    )
+
+    # 2. Mock VideoModel returning real generated video bytes
+    mock_video_model = AsyncMock(spec=VideoModel)
+    mock_video_model.provider = "veo"
+    mock_video_model.model_name = "veo-2.0-generate-001"
+
+    async def fake_submit(req):
+        return VideoOperation(
+            operation_id=f"ops/{req.shot_number}",
+            provider="veo",
+            status="submitted",
+            done=False,
+        )
+
+    async def fake_status(op_id):
+        shot_num = int(op_id.split("/")[-1])
+        data = clip1_bytes if shot_num == 1 else clip2_bytes
+        return VideoOperation(
+            operation_id=op_id,
+            provider="veo",
+            status="completed",
+            done=True,
+            video_bytes=data,
+        )
+
+    mock_video_model.submit_generation.side_effect = fake_submit
+    mock_video_model.get_operation_status.side_effect = fake_status
+
+    video_staging = tmp_path / "video_staging"
+    video_service = VideoGenerationService(
+        video_model=mock_video_model,
+        staging_dir=video_staging,
+        poll_interval_seconds=0.01,
+    )
+
+    # Generate shots through VideoGenerationService
+    job_records = await video_service.generate_storyboard(storyboard)
+    assert len(job_records) == 3
+    assert all(r.status == "completed" for r in job_records)
+
+    # 3. MediaAssemblyService chains generated shots
+    processor = FFmpegMediaProcessor()
+    assembly_staging = tmp_path / "assembly_staging"
+    assembly_service = MediaAssemblyService(
+        media_processor=processor,
+        staging_dir=assembly_staging,
+    )
+
+    assembly_clips = []
+    for r in job_records:
+        local_shot_file = video_staging / str(workflow_id) / f"shot_{r.shot_number}.mp4"
+        assert local_shot_file.exists()
+        assembly_clips.append(
+            MediaClip(
+                shot_number=r.shot_number,
+                source_path=local_shot_file,
+                target_duration_seconds=5.0,
+            )
+        )
+
+    assembly_req = MediaAssemblyRequest(
+        workflow_id=workflow_id,
+        clips=assembly_clips,
+        profile=MediaProfile.from_aspect_ratio(storyboard.aspect_ratio),
+    )
+
+    assembly_result = await assembly_service.assemble(assembly_req)
+
+    # 4. Invariant assertions
+    assert assembly_result.workflow_id == workflow_id
+    assert assembly_result.output_path.exists()
+    assert abs(assembly_result.duration_seconds - 15.0) < 0.5
+    assert assembly_result.media_info.has_video is True
+    assert assembly_result.media_info.width == 1080
+    assert assembly_result.media_info.height == 1920

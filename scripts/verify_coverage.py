@@ -18,9 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-DEFERRED_MODULES: dict[str, str] = {
-    "app/mpt/adapter.py": "Deferred placeholder boundary; implemented & tested in Phase 6",
-}
+DEFERRED_MODULES: dict[str, str] = {}
 
 
 def normalize_coverage_path(raw_path: str, repo_root: Path | None = None) -> str:

@@ -163,6 +163,8 @@ def test_verify_coverage_single_module_below_threshold_fails_gate(tmp_path):
 
 
 def test_verify_coverage_deferred_module_does_not_fail(tmp_path):
+    from unittest.mock import patch
+
     app_dir = tmp_path / "app"
     app_dir.mkdir()
     (app_dir / "good.py").write_text("")
@@ -180,10 +182,14 @@ def test_verify_coverage_deferred_module_does_not_fail(tmp_path):
     }
     cov_file.write_text(json.dumps(payload))
 
-    passed, report = verify_coverage(cov_file, app_dir, tmp_path, threshold=0.90)
-    assert passed is True
-    mpt_res = next(m for m in report["modules"] if m["module"] == "app/mpt/adapter.py")
-    assert mpt_res["status"] == "DEFERRED"
+    with patch.dict(
+        "scripts.verify_coverage.DEFERRED_MODULES",
+        {"app/mpt/adapter.py": "Test deferred module"},
+    ):
+        passed, report = verify_coverage(cov_file, app_dir, tmp_path, threshold=0.90)
+        assert passed is True
+        mpt_res = next(m for m in report["modules"] if m["module"] == "app/mpt/adapter.py")
+        assert mpt_res["status"] == "DEFERRED"
 
 
 def test_verify_coverage_missing_file_fails_gate(tmp_path):

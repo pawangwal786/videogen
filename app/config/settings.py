@@ -39,6 +39,17 @@ class Settings(BaseSettings):
     videogen_primary_text_provider: ModelProvider = ModelProvider.GEMINI
     videogen_fallback_text_provider: ModelProvider | None = ModelProvider.OPENROUTER
 
+    # Media Processing (FFmpeg / MPT)
+    ffmpeg_binary: str = "ffmpeg"
+    ffprobe_binary: str = "ffprobe"
+    media_max_concurrency: int = 2
+    media_assembly_timeout_seconds: float = 300.0
+    media_target_fps: int = 30
+    media_video_codec: str = "libx264"
+    media_pixel_format: str = "yuv420p"
+    media_audio_codec: str = "aac"
+    media_duration_tolerance_seconds: float = 0.5
+
     # Integration testing safety
     videogen_run_external_tests: bool = False
 

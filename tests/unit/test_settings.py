@@ -18,6 +18,15 @@ def test_settings_defaults():
     assert settings.videogen_primary_text_provider == ModelProvider.GEMINI
     assert settings.videogen_fallback_text_provider == ModelProvider.OPENROUTER
     assert settings.videogen_run_external_tests is False
+    assert settings.ffmpeg_binary == "ffmpeg"
+    assert settings.ffprobe_binary == "ffprobe"
+    assert settings.media_max_concurrency == 2
+    assert settings.media_assembly_timeout_seconds == 300.0
+    assert settings.media_target_fps == 30
+    assert settings.media_video_codec == "libx264"
+    assert settings.media_pixel_format == "yuv420p"
+    assert settings.media_audio_codec == "aac"
+    assert settings.media_duration_tolerance_seconds == 0.5
 
 
 def test_require_gemini_success():
