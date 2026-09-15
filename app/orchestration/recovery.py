@@ -1,7 +1,7 @@
 """Recovery worker for detecting expired leases and reconciling ambiguous submissions."""
 
 import asyncio
-from typing import Any, Protocol
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.base import utc_now
 from app.db.session import get_session_factory
 from app.logging import get_logger
-from app.orchestration.errors import ProviderReconciliationRequiredError
 from app.orchestration.retry import compute_next_available_at
 from app.orchestration.state_machine import AttemptStatus, JobStatus
 from app.repositories.job import JobRepository
@@ -85,7 +84,10 @@ class RecoveryWorker:
 
             for attempt in expired_attempts:
                 job = await job_repo.get_job(attempt.job_id)
-                if job is None or job.status in {JobStatus.COMPLETED.value, JobStatus.CANCELLED.value}:
+                if job is None or job.status in {
+                    JobStatus.COMPLETED.value,
+                    JobStatus.CANCELLED.value,
+                }:
                     continue
 
                 now = utc_now()
@@ -106,7 +108,7 @@ class RecoveryWorker:
                             )
                             if reconciled_op_id is None:
                                 confirmed_not_created = True
-                        except Exception as exc:
+                        except Exception as exc:  # noqa: BLE001
                             logger.warning(
                                 "reconciliation_failed_ambiguous",
                                 attempt_id=attempt.id,
@@ -196,7 +198,7 @@ class RecoveryWorker:
             while self._running:
                 try:
                     await self.run_once()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     logger.error("recovery_worker_loop_error", error=str(exc))
                 await asyncio.sleep(interval_seconds)
 

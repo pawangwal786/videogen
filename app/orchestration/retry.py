@@ -1,7 +1,7 @@
 """Retry policy and exponential backoff with jitter."""
 
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 
 def compute_retry_delay(
@@ -11,7 +11,7 @@ def compute_retry_delay(
     jitter: bool = True,
 ) -> float:
     """Compute exponential backoff delay with jitter.
-    
+
     Formula: min(max_delay, base_delay * 2^(attempt - 1)) with uniform jitter.
     """
     clamped_attempt = max(1, attempt)
@@ -34,4 +34,4 @@ def compute_next_available_at(
         max_delay=max_delay,
         jitter=jitter,
     )
-    return datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+    return datetime.now(UTC) + timedelta(seconds=delay_seconds)

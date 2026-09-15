@@ -6,7 +6,9 @@ from typing import Any
 class OrchestrationError(Exception):
     """Base exception for all orchestration domain errors."""
 
-    def __init__(self, message: str, code: str = "ORCHESTRATION_ERROR", details: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, message: str, code: str = "ORCHESTRATION_ERROR", details: dict[str, Any] | None = None
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
@@ -17,11 +19,17 @@ class InvalidStateTransitionError(OrchestrationError):
     """Raised when an illegal state transition is attempted."""
 
     def __init__(self, entity_type: str, current_state: str, target_state: str) -> None:
-        message = f"Invalid {entity_type} state transition from '{current_state}' to '{target_state}'."
+        message = (
+            f"Invalid {entity_type} state transition from '{current_state}' to '{target_state}'."
+        )
         super().__init__(
             message,
             code="INVALID_TRANSITION",
-            details={"entity_type": entity_type, "current_state": current_state, "target_state": target_state},
+            details={
+                "entity_type": entity_type,
+                "current_state": current_state,
+                "target_state": target_state,
+            },
         )
         self.entity_type = entity_type
         self.current_state = current_state
@@ -103,7 +111,11 @@ class ProviderReconciliationRequiredError(OrchestrationError):
         super().__init__(
             f"Attempt '{attempt_id}' for job '{job_id}' is in SUBMISSION_PENDING. External provider reconciliation is required before retry.",
             code="PROVIDER_RECONCILIATION_REQUIRED",
-            details={"job_id": job_id, "attempt_id": attempt_id, "submission_token": submission_token},
+            details={
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "submission_token": submission_token,
+            },
         )
         self.job_id = job_id
         self.attempt_id = attempt_id

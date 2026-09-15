@@ -75,6 +75,7 @@ _JOB_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     JobStatus.PENDING: {JobStatus.CLAIMED, JobStatus.CANCELLED},
     JobStatus.CLAIMED: {
         JobStatus.RUNNING,
+        JobStatus.COMPLETED,
         JobStatus.PENDING,  # Reclaimed or lease expired
         JobStatus.FAILED,
         JobStatus.CANCELLED,
@@ -94,6 +95,7 @@ _ATTEMPT_TRANSITIONS: dict[AttemptStatus, set[AttemptStatus]] = {
     AttemptStatus.CLAIMED: {
         AttemptStatus.SUBMISSION_PENDING,
         AttemptStatus.RUNNING,
+        AttemptStatus.COMPLETED,
         AttemptStatus.FAILED,
         AttemptStatus.EXPIRED,
         AttemptStatus.CANCELLED,
