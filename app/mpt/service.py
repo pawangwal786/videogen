@@ -32,6 +32,11 @@ class MediaAssemblyService:
     ) -> None:
         if max_concurrency < 1:
             raise MediaConfigurationError("max_concurrency must be >= 1", operation="init")
+        if duration_tolerance_seconds < 0.0:
+            raise MediaConfigurationError(
+                "duration_tolerance_seconds must be >= 0",
+                operation="init",
+            )
 
         self.media_processor = media_processor
         self.storage = storage

@@ -351,6 +351,11 @@ def test_media_assembly_service_invalid_concurrency(mock_processor, tmp_path):
         MediaAssemblyService(media_processor=mock_processor, max_concurrency=-2)
 
 
+def test_media_assembly_service_invalid_duration_tolerance(mock_processor, tmp_path):
+    with pytest.raises(MediaConfigurationError, match="duration_tolerance_seconds must be >= 0"):
+        MediaAssemblyService(media_processor=mock_processor, duration_tolerance_seconds=-0.5)
+
+
 @pytest.mark.asyncio
 async def test_resolve_download_missing_target_fails(mock_processor, tmp_path):
     wf_id = uuid4()
