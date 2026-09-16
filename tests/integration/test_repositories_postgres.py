@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.orchestration import (
@@ -407,3 +408,75 @@ async def test_repository_edge_cases_and_queries(db_session: AsyncSession):
 
     with pytest.raises(JobNotFoundError):
         await job_repo.fail_job(non_existent_id, "worker-tester", attempt.lease_token, "ERR", "msg")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_same_logical_job(pg_engine: AsyncEngine):
+    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    async with session_factory() as session:
+        wf_repo = WorkflowRepository(session)
+        wf = await wf_repo.create_workflow(topic="Concurrent Job Test")
+        await session.commit()
+        wf_id = wf.id
+
+    async def create_job_task():
+        async with session_factory() as session:
+            repo = JobRepository(session)
+            job = await repo.create_job(
+                workflow_id=wf_id,
+                logical_key="parallel:step",
+                job_type="research",
+                stage=JobStage.RESEARCH.value,
+                input_payload={"test": 1},
+            )
+            await session.commit()
+            return job.id
+
+    results = await asyncio.gather(*[create_job_task() for _ in range(5)])
+    assert len(set(results)) == 1
+
+    async with session_factory() as session:
+        repo = JobRepository(session)
+        jobs = await repo.list_jobs_for_workflow(wf_id)
+        assert len(jobs) == 1
+        assert jobs[0].logical_key == "parallel:step"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_same_idempotency_key(pg_engine: AsyncEngine):
+    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    key = f"idemp-concurrent-{uuid.uuid4()}"
+
+    async def create_wf_task():
+        async with session_factory() as session:
+            repo = WorkflowRepository(session)
+            wf = await repo.create_workflow(
+                topic="Same Topic Concurrency",
+                idempotency_key=key,
+            )
+            await session.commit()
+            return wf.id
+
+    results = await asyncio.gather(*[create_wf_task() for _ in range(5)])
+    assert len(set(results)) == 1
+
+    async with session_factory() as session:
+        repo = WorkflowRepository(session)
+        wf = await repo.get_workflow(results[0])
+        assert wf is not None
+        assert wf.idempotency_key == key
+
+
+@pytest.mark.asyncio
+async def test_create_job_unrelated_integrity_error_propagates(db_session: AsyncSession):
+    repo = JobRepository(db_session)
+    non_existent_wf_id = str(uuid.uuid4())
+
+    with pytest.raises(IntegrityError):
+        await repo.create_job(
+            workflow_id=non_existent_wf_id,
+            logical_key="orphan_step",
+            job_type="research",
+            stage=JobStage.RESEARCH.value,
+            input_payload={},
+        )

@@ -23,11 +23,41 @@ from app.orchestration.state_machine import (
 )
 
 
+def is_unique_violation(exc: IntegrityError, constraint_hint: str | None = None) -> bool:
+    """Check if IntegrityError is specifically a PostgreSQL unique_violation (code 23505)."""
+    orig = getattr(exc, "orig", None)
+    if orig is None:
+        return False
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if str(sqlstate) != "23505":
+        return False
+    if constraint_hint:
+        diag = getattr(orig, "diag", None)
+        constraint_name = getattr(diag, "constraint_name", None) or getattr(orig, "constraint_name", None)
+        if constraint_name and constraint_hint not in constraint_name:
+            return False
+        if not constraint_name and constraint_hint not in str(orig):
+            return False
+    return True
+
+
 class JobRepository:
     """Repository managing jobs and execution attempts with atomic locking and lease tokens."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def get_by_logical_key(
+        self,
+        workflow_id: str,
+        logical_key: str,
+    ) -> JobModel | None:
+        """Look up a job by its workflow_id and logical_key."""
+        stmt = select(JobModel).where(
+            JobModel.workflow_id == workflow_id,
+            JobModel.logical_key == logical_key,
+        )
+        return (await self._session.execute(stmt)).scalar_one_or_none()
 
     async def create_job(
         self,
@@ -40,11 +70,7 @@ class JobRepository:
         available_at: datetime | None = None,
     ) -> JobModel:
         """Create a job idempotently. If (workflow_id, logical_key) exists, return existing."""
-        stmt = select(JobModel).where(
-            JobModel.workflow_id == workflow_id,
-            JobModel.logical_key == logical_key,
-        )
-        existing = (await self._session.execute(stmt)).scalar_one_or_none()
+        existing = await self.get_by_logical_key(workflow_id, logical_key)
         if existing is not None:
             return existing
 
@@ -58,19 +84,16 @@ class JobRepository:
             available_at=available_at or utc_now(),
             status=JobStatus.PENDING.value,
         )
-        self._session.add(job)
         try:
-            await self._session.flush()
-        except IntegrityError:
-            # Handle race condition on unique constraint
-            stmt = select(JobModel).where(
-                JobModel.workflow_id == workflow_id,
-                JobModel.logical_key == logical_key,
-            )
-            existing = (await self._session.execute(stmt)).scalar_one_or_none()
-            if existing is not None:
-                return existing
-            raise
+            async with self._session.begin_nested():
+                self._session.add(job)
+                await self._session.flush()
+        except IntegrityError as exc:
+            if is_unique_violation(exc, "uq_jobs_workflow_logical_key"):
+                existing = await self.get_by_logical_key(workflow_id, logical_key)
+                if existing is not None:
+                    return existing
+            raise exc
         return job
 
     async def claim_next_job(

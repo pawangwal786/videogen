@@ -13,6 +13,7 @@ from app.orchestration.state_machine import (
     WorkflowStatus,
     validate_workflow_transition,
 )
+from app.repositories.job import is_unique_violation
 
 
 class WorkflowRepository:
@@ -21,6 +22,22 @@ class WorkflowRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def get_by_idempotency_key(self, idempotency_key: str) -> WorkflowModel | None:
+        """Retrieve a workflow by its idempotency_key."""
+        stmt = select(WorkflowModel).where(WorkflowModel.idempotency_key == idempotency_key)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_workflow_for_update(self, workflow_id: str) -> WorkflowModel | None:
+        """Retrieve a workflow by ID with row-level lock (FOR UPDATE)."""
+        stmt = (
+            select(WorkflowModel)
+            .where(WorkflowModel.id == workflow_id)
+            .with_for_update()
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def create_workflow(
         self,
         topic: str,
@@ -28,9 +45,7 @@ class WorkflowRepository:
     ) -> WorkflowModel:
         """Create a new workflow, returning the existing workflow if idempotency key matches identical topic."""
         if idempotency_key is not None:
-            stmt = select(WorkflowModel).where(WorkflowModel.idempotency_key == idempotency_key)
-            result = await self._session.execute(stmt)
-            existing = result.scalar_one_or_none()
+            existing = await self.get_by_idempotency_key(idempotency_key)
             if existing is not None:
                 if existing.topic == topic:
                     return existing
@@ -42,20 +57,18 @@ class WorkflowRepository:
             status=WorkflowStatus.PENDING.value,
             current_stage=JobStage.RESEARCH.value,
         )
-        self._session.add(workflow)
         try:
-            await self._session.flush()
-        except IntegrityError:
-            # Handle race condition where another transaction committed the same idempotency_key
-            if idempotency_key is not None:
-                stmt = select(WorkflowModel).where(WorkflowModel.idempotency_key == idempotency_key)
-                result = await self._session.execute(stmt)
-                existing = result.scalar_one_or_none()
+            async with self._session.begin_nested():
+                self._session.add(workflow)
+                await self._session.flush()
+        except IntegrityError as exc:
+            if idempotency_key is not None and is_unique_violation(exc, "idempotency_key"):
+                existing = await self.get_by_idempotency_key(idempotency_key)
                 if existing is not None:
                     if existing.topic == topic:
                         return existing
-                    raise IdempotencyConflictError(idempotency_key, existing.topic, topic)
-            raise
+                    raise IdempotencyConflictError(idempotency_key, existing.topic, topic) from exc
+            raise exc
         return workflow
 
     async def get_workflow(
