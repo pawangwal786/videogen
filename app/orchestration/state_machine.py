@@ -60,7 +60,11 @@ class ArtifactLifecycleStatus(StrEnum):
 
 # Valid state transitions
 _WORKFLOW_TRANSITIONS: dict[WorkflowStatus, set[WorkflowStatus]] = {
-    WorkflowStatus.PENDING: {WorkflowStatus.RUNNING, WorkflowStatus.CANCELLED},
+    WorkflowStatus.PENDING: {
+        WorkflowStatus.RUNNING,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.CANCELLED,
+    },
     WorkflowStatus.RUNNING: {
         WorkflowStatus.COMPLETED,
         WorkflowStatus.FAILED,

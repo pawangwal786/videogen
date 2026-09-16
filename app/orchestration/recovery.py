@@ -9,9 +9,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db.base import utc_now
 from app.db.session import get_session_factory
 from app.logging import get_logger
+from app.models.errors import ModelRateLimitError, ModelTimeoutError
+from app.orchestration.models import ReconciliationOutcome, ReconciliationStatus
 from app.orchestration.retry import compute_next_available_at
-from app.orchestration.state_machine import AttemptStatus, JobStatus
+from app.orchestration.state_machine import AttemptStatus, JobStatus, WorkflowStatus
 from app.repositories.job import JobRepository
+from app.repositories.workflow import WorkflowRepository
 
 logger = get_logger(__name__)
 
@@ -23,12 +26,8 @@ class ProviderReconciler(Protocol):
         self,
         submission_token: str | None,
         provider_operation_id: str | None,
-    ) -> str | None:
-        """Query provider to find whether an operation was created.
-
-        Returns operation ID if active, None if definitively not created,
-        or raises ProviderReconciliationRequiredError if ambiguous.
-        """
+    ) -> ReconciliationOutcome:
+        """Query provider to find whether an operation was created."""
         ...
 
 
@@ -97,35 +96,50 @@ class RecoveryWorker:
                     provider = attempt.provider
                     reconciler = self._reconcilers.get(provider) if provider else None
 
-                    reconciled_op_id = None
-                    confirmed_not_created = False
+                    outcome: ReconciliationOutcome | None = None
+                    transient_failure = False
 
                     if reconciler is not None:
                         try:
-                            reconciled_op_id = await reconciler.reconcile_submission(
+                            outcome = await reconciler.reconcile_submission(
                                 attempt.submission_token,
                                 attempt.provider_operation_id,
                             )
-                            if reconciled_op_id is None:
-                                confirmed_not_created = True
-                        except Exception as exc:  # noqa: BLE001
+                        except (ModelTimeoutError, ModelRateLimitError, TimeoutError, asyncio.TimeoutError) as exc:
                             logger.warning(
-                                "reconciliation_failed_ambiguous",
+                                "reconciliation_transient_error",
                                 attempt_id=attempt.id,
                                 job_id=job.id,
                                 error=str(exc),
                             )
+                            transient_failure = True
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "reconciliation_failed_unresolved",
+                                attempt_id=attempt.id,
+                                job_id=job.id,
+                                error=str(exc),
+                            )
+                            outcome = ReconciliationOutcome(
+                                status=ReconciliationStatus.UNRESOLVED,
+                                provider_operation_id=attempt.provider_operation_id,
+                                error_message=str(exc),
+                            )
 
-                    if reconciled_op_id is not None:
+                    if transient_failure:
+                        # Leave attempt as SUBMISSION_PENDING so subsequent recovery iteration can retry
+                        continue
+
+                    if outcome is not None and outcome.status == ReconciliationStatus.RESOLVED:
                         # Operation was found running on external provider; resume polling
-                        attempt.provider_operation_id = reconciled_op_id
+                        attempt.provider_operation_id = outcome.provider_operation_id
                         attempt.status = AttemptStatus.RUNNING.value
                         attempt.heartbeat_at = now
                         job.status = JobStatus.RUNNING.value
                         job.version += 1
                         rescheduled += 1
                         recovered_ids.append(job.id)
-                    elif confirmed_not_created:
+                    elif outcome is not None and outcome.status == ReconciliationStatus.CONFIRMED_ABSENT:
                         # Confirmed that provider never received it; safe to mark attempt expired and reschedule
                         attempt.status = AttemptStatus.EXPIRED.value
                         attempt.completed_at = now
@@ -143,17 +157,34 @@ class RecoveryWorker:
                             job.version += 1
                             failed += 1
                     else:
-                        # Ambiguous: do not blindly generate duplicate; fail job with reconciliation required
-                        attempt.status = AttemptStatus.EXPIRED.value
-                        attempt.completed_at = now
-                        job.status = JobStatus.FAILED.value
-                        job.completed_at = now
-                        job.error_code = "PROVIDER_RECONCILIATION_REQUIRED"
-                        job.error_message = (
+                        # Ambiguous / UNRESOLVED: do not blindly generate duplicate; zero automated retries!
+                        error_code = "AMBIGUOUS_SUBMISSION_REQUIRES_MANUAL_RECONCILIATION"
+                        error_message = (
                             f"Worker crashed during ambiguous submission. "
                             f"Submission token: {attempt.submission_token}. Requires manual/provider reconciliation."
                         )
+                        attempt.status = AttemptStatus.FAILED.value
+                        attempt.completed_at = now
+                        attempt.error_code = error_code
+                        attempt.error_message = error_message
+
+                        job.status = JobStatus.FAILED.value
+                        job.completed_at = now
+                        job.error_code = error_code
+                        job.error_message = error_message
                         job.version += 1
+
+                        wf_repo = WorkflowRepository(session)
+                        try:
+                            await wf_repo.update_status(
+                                job.workflow_id,
+                                status=WorkflowStatus.FAILED.value,
+                                error_code=error_code,
+                                error_message=error_message,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.error("failed_to_update_workflow_status_on_ambiguity", error=str(exc))
+
                         ambiguous += 1
                         failed += 1
 
