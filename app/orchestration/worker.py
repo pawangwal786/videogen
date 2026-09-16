@@ -106,6 +106,12 @@ class JobWorker:
             )
             await session.commit()
 
+    async def get_latest_provider_operation_id(self, job_id: str) -> str | None:
+        """Query most recent non-null provider_operation_id for a job across prior attempts."""
+        async with self._session_factory() as session:
+            repo = JobRepository(session)
+            return await repo.get_latest_provider_operation_id(job_id)
+
     async def _heartbeat_loop(self, job_id: str, lease_token: str) -> None:
         """Background task periodically updating the worker's lease heartbeat."""
         while not self._shutdown_requested and self._active_job_id == job_id:

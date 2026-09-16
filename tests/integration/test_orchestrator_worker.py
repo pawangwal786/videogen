@@ -1,6 +1,5 @@
-"""Integration tests for WorkflowOrchestrator and JobWorker against PostgreSQL 16."""
-
 import asyncio
+from datetime import timedelta
 import uuid
 from typing import Any
 
@@ -14,6 +13,8 @@ from app.orchestration import (
     JobStage,
     JobStatus,
     JobWorker,
+    LeaseConflictError,
+    RecoveryWorker,
     WorkflowOrchestrator,
     WorkflowStatus,
 )
@@ -225,7 +226,10 @@ async def test_worker_start_stop_lifecycle(
 
 
 @pytest.mark.asyncio
-async def test_advance_workflow_concurrent_idempotency(pg_engine: AsyncEngine):
+async def test_advance_workflow_concurrent_idempotency(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
     session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
     orchestrator = WorkflowOrchestrator(session_factory)
 
@@ -276,3 +280,205 @@ async def test_advance_workflow_concurrent_idempotency(pg_engine: AsyncEngine):
         jobs = await job_repo.list_jobs_for_workflow(wf_id)
         script_jobs = [j for j in jobs if j.logical_key == "script"]
         assert len(script_jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_restart_resumes_persisted_provider_operation(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Prove that an in-flight provider operation survives a worker crash,
+    and a subsequent worker reclaims the job, sees the persisted operation ID,
+    reconciles/polls it, and advances the workflow without duplicate submission.
+    """
+    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+
+    # Create workflow and video generation job directly
+    async with session_factory() as session:
+        wf_repo = WorkflowRepository(session)
+        job_repo = JobRepository(session)
+        wf = await wf_repo.create_workflow(topic="Crash Recovery Video Shot")
+        wf_id = wf.id
+        job = await job_repo.create_job(
+            workflow_id=wf_id,
+            logical_key="video:shot:1",
+            job_type="video_generation",
+            stage=JobStage.VIDEO_GENERATION.value,
+            input_payload={"prompt": "A futuristic city in neon rain"},
+            max_attempts=3,
+        )
+        job_id = job.id
+        await session.commit()
+
+    provider_submission_count = 0
+    poll_count = 0
+    crash_sync_event = asyncio.Event()
+
+    class ResumableVideoHandler:
+        async def execute(self, job: JobModel, attempt: JobAttemptModel, worker: JobWorker) -> dict[str, Any]:
+            nonlocal provider_submission_count, poll_count
+
+            existing_op_id = await worker.get_latest_provider_operation_id(job.id)
+
+            if existing_op_id is None:
+                # First attempt: submit to provider
+                await worker.record_submission_pending("veo", job.input_payload)
+                provider_submission_count += 1
+                op_id = "operations/veo-real-4567"
+                await worker.record_submitted(op_id)
+                crash_sync_event.set()
+                # Simulate abrupt crash/interdiction right after committing operation ID to DB
+                raise SystemExit("Simulated Worker A crash/SIGKILL")
+            else:
+                # Resumed attempt: do NOT re-submit to provider! Poll existing operation
+                poll_count += 1
+                return {
+                    "operation_id": existing_op_id,
+                    "video_path": "tmp/staging/shot_1.mp4",
+                    "status": "completed",
+                }
+
+    # Worker A executes and crashes right after recording submitted
+    worker_a = JobWorker(session_factory=session_factory, worker_id="worker-A")
+    worker_a.register_handler("video_generation", ResumableVideoHandler())
+
+    with pytest.raises(SystemExit):
+        await worker_a.run_once()
+
+    assert crash_sync_event.is_set()
+    assert provider_submission_count == 1
+
+    # Verify that operation ID survived Worker A's crash in PostgreSQL
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        persisted_op_id = await job_repo.get_latest_provider_operation_id(job_id)
+        assert persisted_op_id == "operations/veo-real-4567"
+
+        # Backdate heartbeat of Worker A's attempt to simulate lease expiration
+        job_with_att = await job_repo.get_job(job_id, load_attempts=True)
+        assert job_with_att is not None and len(job_with_att.attempts) > 0
+        attempt_a = job_with_att.attempts[0]
+        attempt_a.heartbeat_at = utc_now() - timedelta(seconds=120)
+        await session.commit()
+
+    # Recovery worker runs: detects expired lease and reschedules job for retry
+    recovery_worker = RecoveryWorker(session_factory=session_factory, lease_timeout_seconds=30.0)
+    report = await recovery_worker.run_once()
+    assert report.expired_attempts_detected >= 1
+    assert report.jobs_rescheduled >= 1
+
+    # Clear retry backoff for immediate test assertion
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        rescheduled_job = await job_repo.get_job(job_id)
+        assert rescheduled_job is not None
+        rescheduled_job.available_at = utc_now()
+        await session.commit()
+
+    # Worker B starts, claims the rescheduled job, sees the persisted operation ID, and finishes it
+    worker_b = JobWorker(session_factory=session_factory, worker_id="worker-B")
+    worker_b.register_handler("video_generation", ResumableVideoHandler())
+
+    processed = await worker_b.run_once()
+    assert processed is True
+    assert provider_submission_count == 1  # ZERO duplicate submission!
+    assert poll_count == 1
+
+    # Verify database state
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        recovered_job = await job_repo.get_job(job_id, load_attempts=True)
+        assert recovered_job is not None
+        assert recovered_job.status == JobStatus.COMPLETED.value
+        assert recovered_job.output_payload["operation_id"] == "operations/veo-real-4567"
+        assert len(recovered_job.attempts) == 2
+        assert recovered_job.attempts[0].status == AttemptStatus.EXPIRED.value
+        assert recovered_job.attempts[1].status == AttemptStatus.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_preserves_attempt_and_blocks_stale_mutation(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Prove that when Worker A's lease expires and Worker B reclaims the job,
+    any stale mutations from Worker A are rejected with LeaseConflictError at DB level,
+    and Worker B's active ownership is preserved untouched.
+    """
+    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    wf_repo = WorkflowRepository(db_session)
+    job_repo = JobRepository(db_session)
+
+    wf = await wf_repo.create_workflow(topic="Fencing Test")
+    job = await job_repo.create_job(
+        workflow_id=wf.id,
+        logical_key="script",
+        job_type="script",
+        stage=JobStage.SCRIPT.value,
+        input_payload={"topic": "Fencing"},
+        max_attempts=3,
+    )
+    job_id = job.id
+    await db_session.commit()
+
+    # 1. Worker A claims the job
+    worker_id_a = "worker-A"
+    claim_a = await job_repo.claim_next_job(worker_id=worker_id_a)
+    assert claim_a is not None
+    job_a, attempt_a = claim_a
+    lease_token_a = attempt_a.lease_token
+    await db_session.commit()
+
+    # 2. Worker A's lease expires (marked EXPIRED in DB)
+    attempt_a.status = AttemptStatus.EXPIRED.value
+    attempt_a.completed_at = utc_now()
+    job_a.status = JobStatus.PENDING.value
+    job_a.version += 1
+    await db_session.commit()
+
+    # 3. Worker B claims the job
+    worker_id_b = "worker-B"
+    claim_b = await job_repo.claim_next_job(worker_id=worker_id_b)
+    assert claim_b is not None
+    job_b, attempt_b = claim_b
+    lease_token_b = attempt_b.lease_token
+    await db_session.commit()
+
+    assert lease_token_a != lease_token_b
+    assert attempt_b.worker_id == worker_id_b
+    assert attempt_b.status == AttemptStatus.CLAIMED.value
+
+    # 4. Stale Worker A attempts mutation with its old lease_token_a
+    async with session_factory() as stale_session:
+        stale_repo = JobRepository(stale_session)
+
+        # Heartbeat attempt with stale token -> rejected
+        with pytest.raises(LeaseConflictError):
+            await stale_repo.heartbeat_attempt(job_id, worker_id_a, lease_token_a)
+
+        # Record submission pending with stale token -> rejected
+        with pytest.raises(LeaseConflictError):
+            await stale_repo.record_submission_pending(job_id, worker_id_a, lease_token_a, "veo")
+
+        # Record submitted with stale token -> rejected
+        with pytest.raises(LeaseConflictError):
+            await stale_repo.record_submitted(job_id, worker_id_a, lease_token_a, "op-stale")
+
+        # Complete job with stale token -> rejected
+        with pytest.raises(LeaseConflictError):
+            await stale_repo.complete_job(job_id, worker_id_a, lease_token_a, {"output": "stale"})
+
+    # 5. Assert Worker B's state in PostgreSQL was NOT modified
+    db_session.expire_all()
+    current_job = await job_repo.get_job(job_id, load_attempts=True)
+    assert current_job is not None
+    assert current_job.current_attempt_id == attempt_b.id
+    assert current_job.status == JobStatus.CLAIMED.value
+    assert current_job.output_payload is None
+
+    active_b = await job_repo.get_active_attempt(job_id, worker_id_b, lease_token_b)
+    assert active_b.id == attempt_b.id
+    assert active_b.worker_id == worker_id_b
+    assert active_b.lease_token == lease_token_b
+    assert active_b.status == AttemptStatus.CLAIMED.value
+

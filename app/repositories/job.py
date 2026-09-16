@@ -322,6 +322,20 @@ class JobRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_latest_provider_operation_id(self, job_id: str) -> str | None:
+        """Find the most recent non-null provider_operation_id across attempts for this job."""
+        stmt = (
+            select(JobAttemptModel.provider_operation_id)
+            .where(
+                JobAttemptModel.job_id == job_id,
+                JobAttemptModel.provider_operation_id.is_not(None),
+            )
+            .order_by(JobAttemptModel.attempt_number.desc())
+            .limit(1)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def find_expired_leases(self, lease_timeout_seconds: float) -> list[JobAttemptModel]:
         """Locate all active job attempts whose heartbeat has exceeded lease_timeout_seconds."""
         cutoff = utc_now() - timedelta(seconds=lease_timeout_seconds)
