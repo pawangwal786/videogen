@@ -1,12 +1,15 @@
 """Workflow orchestrator driving state transitions and pipeline stages."""
 
+from typing import Any
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.session import get_session_factory
 from app.logging import get_logger
 from app.orchestration.errors import WorkflowNotFoundError
-from app.orchestration.models import Workflow
+from app.orchestration.models import Artifact, Workflow
 from app.orchestration.state_machine import JobStage, JobStatus, WorkflowStatus
+from app.repositories.artifact import ArtifactRepository
 from app.repositories.job import JobRepository
 from app.repositories.workflow import WorkflowRepository
 
@@ -21,6 +24,46 @@ class WorkflowOrchestrator:
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._session_factory = session_factory or get_session_factory()
+
+    async def create_artifact(
+        self,
+        workflow_id: str,
+        artifact_type: str,
+        storage_path: str,
+        job_id: str | None = None,
+        gdrive_file_id: str | None = None,
+        file_size_bytes: int | None = None,
+        checksum: str | None = None,
+        mime_type: str | None = None,
+        artifact_metadata: dict[str, Any] | None = None,
+    ) -> Artifact:
+        """Persist a new artifact and link to workflow and optional producing job."""
+        async with self._session_factory() as session:
+            repo = ArtifactRepository(session)
+            model = await repo.create_artifact(
+                workflow_id=workflow_id,
+                artifact_type=artifact_type,
+                storage_path=storage_path,
+                job_id=job_id,
+                gdrive_file_id=gdrive_file_id,
+                file_size_bytes=file_size_bytes,
+                checksum=checksum,
+                mime_type=mime_type,
+                artifact_metadata=artifact_metadata,
+            )
+            await session.commit()
+            return Artifact.model_validate(model)
+
+    async def list_artifacts_for_workflow(
+        self,
+        workflow_id: str,
+        artifact_type: str | None = None,
+    ) -> list[Artifact]:
+        """List all artifacts for a given workflow."""
+        async with self._session_factory() as session:
+            repo = ArtifactRepository(session)
+            models = await repo.list_artifacts_for_workflow(workflow_id, artifact_type=artifact_type)
+            return [Artifact.model_validate(m) for m in models]
 
     async def create_workflow(
         self,
@@ -85,7 +128,7 @@ class WorkflowOrchestrator:
             wf_repo = WorkflowRepository(session)
             job_repo = JobRepository(session)
 
-            wf = await wf_repo.get_workflow(workflow_id)
+            wf = await wf_repo.get_workflow_for_update(workflow_id)
             if wf is None:
                 raise WorkflowNotFoundError(workflow_id)
 
@@ -111,17 +154,17 @@ class WorkflowOrchestrator:
                         error_message=r_job.error_message,
                     )
                 elif r_job and r_job.status == JobStatus.COMPLETED.value:
-                    # Spawn SCRIPT job
-                    await job_repo.create_job(
-                        workflow_id=workflow_id,
-                        logical_key="script",
-                        job_type="script",
-                        stage=JobStage.SCRIPT.value,
-                        input_payload={
-                            "topic": wf.topic,
-                            "research_output": r_job.output_payload,
-                        },
-                    )
+                    if "script" not in jobs_by_key:
+                        await job_repo.create_job(
+                            workflow_id=workflow_id,
+                            logical_key="script",
+                            job_type="script",
+                            stage=JobStage.SCRIPT.value,
+                            input_payload={
+                                "topic": wf.topic,
+                                "research_output": r_job.output_payload,
+                            },
+                        )
                     await wf_repo.update_status(
                         workflow_id,
                         status=WorkflowStatus.RUNNING.value,
@@ -138,16 +181,16 @@ class WorkflowOrchestrator:
                         error_message=s_job.error_message,
                     )
                 elif s_job and s_job.status == JobStatus.COMPLETED.value:
-                    # Spawn STORYBOARD job
-                    await job_repo.create_job(
-                        workflow_id=workflow_id,
-                        logical_key="storyboard",
-                        job_type="storyboard",
-                        stage=JobStage.STORYBOARD.value,
-                        input_payload={
-                            "script_output": s_job.output_payload,
-                        },
-                    )
+                    if "storyboard" not in jobs_by_key:
+                        await job_repo.create_job(
+                            workflow_id=workflow_id,
+                            logical_key="storyboard",
+                            job_type="storyboard",
+                            stage=JobStage.STORYBOARD.value,
+                            input_payload={
+                                "script_output": s_job.output_payload,
+                            },
+                        )
                     await wf_repo.update_status(
                         workflow_id,
                         status=WorkflowStatus.RUNNING.value,
@@ -164,7 +207,6 @@ class WorkflowOrchestrator:
                         error_message=sb_job.error_message,
                     )
                 elif sb_job and sb_job.status == JobStatus.COMPLETED.value:
-                    # Spawn discrete shot video generation jobs
                     shots = sb_job.output_payload.get("shots", []) if sb_job.output_payload else []
                     aspect_ratio = (
                         sb_job.output_payload.get("aspect_ratio", "9:16")
@@ -174,17 +216,19 @@ class WorkflowOrchestrator:
 
                     for shot in shots:
                         shot_num = shot.get("shot_number")
-                        await job_repo.create_job(
-                            workflow_id=workflow_id,
-                            logical_key=f"video:shot:{shot_num}",
-                            job_type="video_generation",
-                            stage=JobStage.VIDEO_GENERATION.value,
-                            input_payload={
-                                "workflow_id": workflow_id,
-                                "shot": shot,
-                                "aspect_ratio": aspect_ratio,
-                            },
-                        )
+                        key = f"video:shot:{shot_num}"
+                        if key not in jobs_by_key:
+                            await job_repo.create_job(
+                                workflow_id=workflow_id,
+                                logical_key=key,
+                                job_type="video_generation",
+                                stage=JobStage.VIDEO_GENERATION.value,
+                                input_payload={
+                                    "workflow_id": workflow_id,
+                                    "shot": shot,
+                                    "aspect_ratio": aspect_ratio,
+                                },
+                            )
 
                     await wf_repo.update_status(
                         workflow_id,
@@ -208,20 +252,20 @@ class WorkflowOrchestrator:
                         error_message=first_fail.error_message,
                     )
                 elif all_completed:
-                    # Spawn MEDIA_ASSEMBLY job
-                    shot_outputs = [
-                        j.output_payload for j in sorted(video_jobs, key=lambda x: x.logical_key)
-                    ]
-                    await job_repo.create_job(
-                        workflow_id=workflow_id,
-                        logical_key="media_assembly",
-                        job_type="media_assembly",
-                        stage=JobStage.MEDIA_ASSEMBLY.value,
-                        input_payload={
-                            "workflow_id": workflow_id,
-                            "shots": shot_outputs,
-                        },
-                    )
+                    if "media_assembly" not in jobs_by_key:
+                        shot_outputs = [
+                            j.output_payload for j in sorted(video_jobs, key=lambda x: x.logical_key)
+                        ]
+                        await job_repo.create_job(
+                            workflow_id=workflow_id,
+                            logical_key="media_assembly",
+                            job_type="media_assembly",
+                            stage=JobStage.MEDIA_ASSEMBLY.value,
+                            input_payload={
+                                "workflow_id": workflow_id,
+                                "shots": shot_outputs,
+                            },
+                        )
                     await wf_repo.update_status(
                         workflow_id,
                         status=WorkflowStatus.RUNNING.value,

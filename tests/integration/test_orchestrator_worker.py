@@ -1,13 +1,16 @@
 """Integration tests for WorkflowOrchestrator and JobWorker against PostgreSQL 16."""
 
 import asyncio
+import uuid
 from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.db.base import utc_now
 from app.db.models.job import JobAttemptModel, JobModel
 from app.orchestration import (
+    AttemptStatus,
     JobStage,
     JobStatus,
     JobWorker,
@@ -219,3 +222,57 @@ async def test_worker_start_stop_lifecycle(
     await asyncio.sleep(0.1)
     await worker.stop()
     assert worker._running is False
+
+
+@pytest.mark.asyncio
+async def test_advance_workflow_concurrent_idempotency(pg_engine: AsyncEngine):
+    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    orchestrator = WorkflowOrchestrator(session_factory)
+
+    wf = await orchestrator.create_workflow(topic="Parallel Advance Test")
+    wf_id = wf.id
+
+    # Complete the research job specifically for this workflow
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        jobs = await job_repo.list_jobs_for_workflow(wf_id)
+        r_job = next(j for j in jobs if j.logical_key == "research")
+        now = utc_now()
+        token = str(uuid.uuid4())
+        attempt = JobAttemptModel(
+            job_id=r_job.id,
+            attempt_number=1,
+            worker_id="test-worker",
+            lease_token=token,
+            status=AttemptStatus.CLAIMED.value,
+            started_at=now,
+            heartbeat_at=now,
+            submission_token=f"{r_job.workflow_id}:{r_job.logical_key}:1",
+            request_payload=r_job.input_payload,
+        )
+        session.add(attempt)
+        await session.flush()
+        r_job.status = JobStatus.CLAIMED.value
+        r_job.current_attempt_id = attempt.id
+        await session.flush()
+        await job_repo.complete_job(r_job.id, "test-worker", token, {"findings": "verified"})
+        await session.commit()
+
+    # Advance workflow concurrently from 10 independent callers
+    async def advance_task():
+        caller_orch = WorkflowOrchestrator(session_factory)
+        return await caller_orch.advance_workflow(wf_id)
+
+    results = await asyncio.gather(*[advance_task() for _ in range(10)])
+
+    # All callers receive coherent workflow state
+    for res in results:
+        assert res.status == WorkflowStatus.RUNNING
+        assert res.current_stage == JobStage.SCRIPT
+
+    # Verify exactly one script job was created in the database
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        jobs = await job_repo.list_jobs_for_workflow(wf_id)
+        script_jobs = [j for j in jobs if j.logical_key == "script"]
+        assert len(script_jobs) == 1
