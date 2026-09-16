@@ -15,6 +15,8 @@ from app.orchestration.models import (
     ClaimedJob,
     Job,
     JobAttempt,
+    ReconciliationOutcome,
+    ReconciliationStatus,
     Workflow,
 )
 from app.orchestration.orchestrator import WorkflowOrchestrator
@@ -54,6 +56,8 @@ __all__ = [
     "OrchestrationError",
     "ProviderReconciler",
     "ProviderReconciliationRequiredError",
+    "ReconciliationOutcome",
+    "ReconciliationStatus",
     "RecoveryReport",
     "RecoveryWorker",
     "Workflow",

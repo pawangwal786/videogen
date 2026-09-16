@@ -1,6 +1,7 @@
 """Domain models for workflow orchestration."""
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -12,6 +13,26 @@ from app.orchestration.state_machine import (
     JobStatus,
     WorkflowStatus,
 )
+
+
+class ReconciliationStatus(StrEnum):
+    """Status outcomes for in-flight external provider reconciliation."""
+
+    RESOLVED = "RESOLVED"
+    CONFIRMED_ABSENT = "CONFIRMED_ABSENT"
+    UNRESOLVED = "UNRESOLVED"
+
+
+class ReconciliationOutcome(BaseModel):
+    """Immutable result of reconciling an in-flight external provider submission."""
+
+    model_config = ConfigDict(frozen=True)
+
+    status: ReconciliationStatus
+    provider_operation_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+
 
 
 class Workflow(BaseModel):
