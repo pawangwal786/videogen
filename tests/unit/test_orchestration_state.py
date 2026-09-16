@@ -1,7 +1,7 @@
 """Unit tests for orchestration state machines, domain models, and error hierarchy."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -156,7 +156,7 @@ def test_domain_errors():
 
 
 def test_domain_models():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     wf = Workflow(
         id=str(uuid.uuid4()),
         topic="Neural Networks",

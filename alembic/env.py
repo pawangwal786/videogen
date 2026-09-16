@@ -17,10 +17,10 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Import application Base and models for metadata and migration generation
-from app.config.settings import get_settings
-from app.db import Base
 # Ensure all models are registered on metadata
 import app.db.models  # noqa: F401
+from app.config.settings import get_settings
+from app.db import Base
 
 target_metadata = Base.metadata
 
@@ -69,7 +69,9 @@ async def run_async_migrations() -> None:
 
     """
     section = config.get_section(config.config_ini_section, {})
-    if not section.get("sqlalchemy.url") or "driver://user:pass@localhost/dbname" in section.get("sqlalchemy.url", ""):
+    if not section.get("sqlalchemy.url") or "driver://user:pass@localhost/dbname" in section.get(
+        "sqlalchemy.url", ""
+    ):
         section["sqlalchemy.url"] = get_settings().get_database_url()
 
     connectable = async_engine_from_config(

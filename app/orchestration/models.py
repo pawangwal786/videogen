@@ -34,7 +34,6 @@ class ReconciliationOutcome(BaseModel):
     error_message: str | None = None
 
 
-
 class Workflow(BaseModel):
     """Domain model representing a video generation workflow."""
 

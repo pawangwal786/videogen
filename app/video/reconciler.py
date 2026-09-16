@@ -1,7 +1,5 @@
 """Veo provider operation reconciler."""
 
-import asyncio
-
 from app.logging import get_logger
 from app.models.errors import (
     ModelAuthenticationError,
@@ -53,7 +51,7 @@ class VeoProviderReconciler:
                     provider_operation_id=op.operation_id,
                     metadata={"status": op.status, "done": op.done},
                 )
-            except (ModelTimeoutError, ModelRateLimitError, TimeoutError, asyncio.TimeoutError) as exc:
+            except (ModelTimeoutError, ModelRateLimitError, TimeoutError) as exc:
                 logger.warning(
                     "veo.reconciliation.transient_error",
                     provider_operation_id=provider_operation_id,

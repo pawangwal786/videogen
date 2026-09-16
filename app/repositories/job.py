@@ -33,7 +33,9 @@ def is_unique_violation(exc: IntegrityError, constraint_hint: str | None = None)
         return False
     if constraint_hint:
         diag = getattr(orig, "diag", None)
-        constraint_name = getattr(diag, "constraint_name", None) or getattr(orig, "constraint_name", None)
+        constraint_name = getattr(diag, "constraint_name", None) or getattr(
+            orig, "constraint_name", None
+        )
         if constraint_name and constraint_hint not in constraint_name:
             return False
         if not constraint_name and constraint_hint not in str(orig):
@@ -93,7 +95,7 @@ class JobRepository:
                 existing = await self.get_by_logical_key(workflow_id, logical_key)
                 if existing is not None:
                     return existing
-            raise exc
+            raise
         return job
 
     async def claim_next_job(
@@ -119,7 +121,9 @@ class JobRepository:
             return None
 
         # Determine attempt number
-        max_att_stmt = select(func.max(JobAttemptModel.attempt_number)).where(JobAttemptModel.job_id == job.id)
+        max_att_stmt = select(func.max(JobAttemptModel.attempt_number)).where(
+            JobAttemptModel.job_id == job.id
+        )
         current_max = (await self._session.execute(max_att_stmt)).scalar() or 0
         attempt_number = current_max + 1
 
@@ -170,11 +174,13 @@ class JobRepository:
             JobAttemptModel.job_id == job_id,
             JobAttemptModel.worker_id == worker_id,
             JobAttemptModel.lease_token == lease_token,
-            JobAttemptModel.status.in_([
-                AttemptStatus.CLAIMED.value,
-                AttemptStatus.SUBMISSION_PENDING.value,
-                AttemptStatus.RUNNING.value,
-            ]),
+            JobAttemptModel.status.in_(
+                [
+                    AttemptStatus.CLAIMED.value,
+                    AttemptStatus.SUBMISSION_PENDING.value,
+                    AttemptStatus.RUNNING.value,
+                ]
+            ),
         )
         attempt = (await self._session.execute(stmt)).scalar_one_or_none()
         if attempt is None:
@@ -342,11 +348,13 @@ class JobRepository:
         stmt = (
             select(JobAttemptModel)
             .where(
-                JobAttemptModel.status.in_([
-                    AttemptStatus.CLAIMED.value,
-                    AttemptStatus.SUBMISSION_PENDING.value,
-                    AttemptStatus.RUNNING.value,
-                ]),
+                JobAttemptModel.status.in_(
+                    [
+                        AttemptStatus.CLAIMED.value,
+                        AttemptStatus.SUBMISSION_PENDING.value,
+                        AttemptStatus.RUNNING.value,
+                    ]
+                ),
                 JobAttemptModel.heartbeat_at < cutoff,
             )
             .order_by(JobAttemptModel.heartbeat_at.asc())

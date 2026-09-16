@@ -105,7 +105,7 @@ class RecoveryWorker:
                                 attempt.submission_token,
                                 attempt.provider_operation_id,
                             )
-                        except (ModelTimeoutError, ModelRateLimitError, TimeoutError, asyncio.TimeoutError) as exc:
+                        except (ModelTimeoutError, ModelRateLimitError, TimeoutError) as exc:
                             logger.warning(
                                 "reconciliation_transient_error",
                                 attempt_id=attempt.id,
@@ -139,7 +139,10 @@ class RecoveryWorker:
                         job.version += 1
                         rescheduled += 1
                         recovered_ids.append(job.id)
-                    elif outcome is not None and outcome.status == ReconciliationStatus.CONFIRMED_ABSENT:
+                    elif (
+                        outcome is not None
+                        and outcome.status == ReconciliationStatus.CONFIRMED_ABSENT
+                    ):
                         # Confirmed that provider never received it; safe to mark attempt expired and reschedule
                         attempt.status = AttemptStatus.EXPIRED.value
                         attempt.completed_at = now
@@ -183,7 +186,9 @@ class RecoveryWorker:
                                 error_message=error_message,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            logger.error("failed_to_update_workflow_status_on_ambiguity", error=str(exc))
+                            logger.error(
+                                "failed_to_update_workflow_status_on_ambiguity", error=str(exc)
+                            )
 
                         ambiguous += 1
                         failed += 1

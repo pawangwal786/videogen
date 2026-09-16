@@ -1,6 +1,6 @@
 """Unit tests for retry and backoff calculations."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.orchestration.retry import compute_next_available_at, compute_retry_delay
 
@@ -28,7 +28,7 @@ def test_compute_retry_delay_bounds():
 
 
 def test_compute_next_available_at():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     avail = compute_next_available_at(attempt=1, base_delay=2.0, max_delay=10.0, jitter=False)
     assert avail > now
     assert (avail - now).total_seconds() >= 1.9

@@ -30,11 +30,7 @@ class WorkflowRepository:
 
     async def get_workflow_for_update(self, workflow_id: str) -> WorkflowModel | None:
         """Retrieve a workflow by ID with row-level lock (FOR UPDATE)."""
-        stmt = (
-            select(WorkflowModel)
-            .where(WorkflowModel.id == workflow_id)
-            .with_for_update()
-        )
+        stmt = select(WorkflowModel).where(WorkflowModel.id == workflow_id).with_for_update()
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -68,7 +64,7 @@ class WorkflowRepository:
                     if existing.topic == topic:
                         return existing
                     raise IdempotencyConflictError(idempotency_key, existing.topic, topic) from exc
-            raise exc
+            raise
         return workflow
 
     async def get_workflow(
@@ -107,7 +103,11 @@ class WorkflowRepository:
             workflow.error_code = error_code
         if error_message is not None:
             workflow.error_message = error_message
-        if status in {WorkflowStatus.COMPLETED.value, WorkflowStatus.FAILED.value, WorkflowStatus.CANCELLED.value}:
+        if status in {
+            WorkflowStatus.COMPLETED.value,
+            WorkflowStatus.FAILED.value,
+            WorkflowStatus.CANCELLED.value,
+        }:
             workflow.completed_at = utc_now()
         await self._session.flush()
         return workflow
@@ -119,7 +119,12 @@ class WorkflowRepository:
         status: str | None = None,
     ) -> list[WorkflowModel]:
         """List workflows ordered by creation date descending with optional status filter."""
-        stmt = select(WorkflowModel).order_by(WorkflowModel.created_at.desc()).limit(limit).offset(offset)
+        stmt = (
+            select(WorkflowModel)
+            .order_by(WorkflowModel.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
         if status is not None:
             stmt = stmt.where(WorkflowModel.status == status)
         result = await self._session.execute(stmt)

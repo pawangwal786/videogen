@@ -142,8 +142,14 @@ def test_database_settings_defaults_and_methods():
         database_url="postgresql+asyncpg://user:pass@localhost:5432/main",
         test_database_url="postgresql+asyncpg://user:pass@localhost:5432/test",
     )
-    assert test_settings.get_database_url(for_test=False) == "postgresql+asyncpg://user:pass@localhost:5432/main"
-    assert test_settings.get_database_url(for_test=True) == "postgresql+asyncpg://user:pass@localhost:5432/test"
+    assert (
+        test_settings.get_database_url(for_test=False)
+        == "postgresql+asyncpg://user:pass@localhost:5432/main"
+    )
+    assert (
+        test_settings.get_database_url(for_test=True)
+        == "postgresql+asyncpg://user:pass@localhost:5432/test"
+    )
 
 
 def test_database_settings_validation_errors():

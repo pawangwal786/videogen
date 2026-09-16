@@ -2,7 +2,12 @@
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.config.settings import get_settings
 from app.db.base import Base
@@ -44,7 +49,7 @@ async def pg_engine(postgres_url: str):
     try:
         async with engine.connect() as conn:
             await conn.execute(text("SELECT 1"))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.fail(
             f"PostgreSQL connection to {postgres_url} failed: {exc}. "
             "Integration tests require a reachable PostgreSQL 16 instance."
@@ -69,7 +74,9 @@ async def db_session(pg_engine: AsyncEngine):
     )
     # Clean tables before test
     async with pg_engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE artifacts, job_attempts, jobs, workflows RESTART IDENTITY CASCADE"))
+        await conn.execute(
+            text("TRUNCATE TABLE artifacts, job_attempts, jobs, workflows RESTART IDENTITY CASCADE")
+        )
 
     async with session_factory() as session:
         yield session

@@ -62,7 +62,9 @@ class WorkflowOrchestrator:
         """List all artifacts for a given workflow."""
         async with self._session_factory() as session:
             repo = ArtifactRepository(session)
-            models = await repo.list_artifacts_for_workflow(workflow_id, artifact_type=artifact_type)
+            models = await repo.list_artifacts_for_workflow(
+                workflow_id, artifact_type=artifact_type
+            )
             return [Artifact.model_validate(m) for m in models]
 
     async def create_workflow(
@@ -254,7 +256,8 @@ class WorkflowOrchestrator:
                 elif all_completed:
                     if "media_assembly" not in jobs_by_key:
                         shot_outputs = [
-                            j.output_payload for j in sorted(video_jobs, key=lambda x: x.logical_key)
+                            j.output_payload
+                            for j in sorted(video_jobs, key=lambda x: x.logical_key)
                         ]
                         await job_repo.create_job(
                             workflow_id=workflow_id,

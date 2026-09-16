@@ -82,6 +82,4 @@ class ArtifactModel(Base, TimestampMixin):
         back_populates="artifacts",
     )
 
-    __table_args__ = (
-        Index("ix_artifacts_workflow_type", "workflow_id", "artifact_type"),
-    )
+    __table_args__ = (Index("ix_artifacts_workflow_type", "workflow_id", "artifact_type"),)

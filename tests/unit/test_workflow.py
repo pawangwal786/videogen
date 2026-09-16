@@ -1,11 +1,9 @@
 """Unit tests for orchestration domain models."""
 
-from datetime import datetime, timezone
 import uuid
+from datetime import UTC, datetime
 
 from app.orchestration.models import (
-    Artifact,
-    ClaimedJob,
     Job,
     JobAttempt,
     ReconciliationOutcome,
@@ -13,7 +11,6 @@ from app.orchestration.models import (
     Workflow,
 )
 from app.orchestration.state_machine import (
-    ArtifactLifecycleStatus,
     AttemptStatus,
     JobStage,
     JobStatus,
@@ -22,7 +19,7 @@ from app.orchestration.state_machine import (
 
 
 def test_workflow_domain_model_defaults():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     wf = Workflow(
         id=str(uuid.uuid4()),
         topic="AI infrastructure",
@@ -36,7 +33,7 @@ def test_workflow_domain_model_defaults():
 
 
 def test_job_domain_model_defaults():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     job = Job(
         id=str(uuid.uuid4()),
         workflow_id=str(uuid.uuid4()),
@@ -53,7 +50,7 @@ def test_job_domain_model_defaults():
 
 
 def test_job_attempt_domain_model():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     attempt = JobAttempt(
         id=str(uuid.uuid4()),
         job_id=str(uuid.uuid4()),

@@ -1,14 +1,14 @@
 """Unit tests for database models and session management."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.pool import NullPool
 
 from app.config.settings import Settings
-from app.db.base import Base, TimestampMixin, utc_now
+from app.db.base import utc_now
 from app.db.models.artifact import ArtifactModel
 from app.db.models.job import JobAttemptModel, JobModel
 from app.db.models.workflow import WorkflowModel
@@ -24,7 +24,7 @@ from app.db.session import (
 
 def test_utc_now():
     now = utc_now()
-    assert now.tzinfo == timezone.utc
+    assert now.tzinfo == UTC
     assert isinstance(now, datetime)
 
 

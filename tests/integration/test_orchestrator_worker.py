@@ -1,6 +1,6 @@
 import asyncio
-from datetime import timedelta
 import uuid
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -230,7 +230,9 @@ async def test_advance_workflow_concurrent_idempotency(
     pg_engine: AsyncEngine,
     db_session: AsyncSession,
 ):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     orchestrator = WorkflowOrchestrator(session_factory)
 
     wf = await orchestrator.create_workflow(topic="Parallel Advance Test")
@@ -291,7 +293,9 @@ async def test_worker_restart_resumes_persisted_provider_operation(
     and a subsequent worker reclaims the job, sees the persisted operation ID,
     reconciles/polls it, and advances the workflow without duplicate submission.
     """
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     # Create workflow and video generation job directly
     async with session_factory() as session:
@@ -315,7 +319,9 @@ async def test_worker_restart_resumes_persisted_provider_operation(
     crash_sync_event = asyncio.Event()
 
     class ResumableVideoHandler:
-        async def execute(self, job: JobModel, attempt: JobAttemptModel, worker: JobWorker) -> dict[str, Any]:
+        async def execute(
+            self, job: JobModel, attempt: JobAttemptModel, worker: JobWorker
+        ) -> dict[str, Any]:
             nonlocal provider_submission_count, poll_count
 
             existing_op_id = await worker.get_latest_provider_operation_id(job.id)
@@ -405,7 +411,9 @@ async def test_worker_shutdown_preserves_attempt_and_blocks_stale_mutation(
     any stale mutations from Worker A are rejected with LeaseConflictError at DB level,
     and Worker B's active ownership is preserved untouched.
     """
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     wf_repo = WorkflowRepository(db_session)
     job_repo = JobRepository(db_session)
 
@@ -440,7 +448,7 @@ async def test_worker_shutdown_preserves_attempt_and_blocks_stale_mutation(
     worker_id_b = "worker-B"
     claim_b = await job_repo.claim_next_job(worker_id=worker_id_b)
     assert claim_b is not None
-    job_b, attempt_b = claim_b
+    _job_b, attempt_b = claim_b
     lease_token_b = attempt_b.lease_token
     await db_session.commit()
 
@@ -481,4 +489,3 @@ async def test_worker_shutdown_preserves_attempt_and_blocks_stale_mutation(
     assert active_b.worker_id == worker_id_b
     assert active_b.lease_token == lease_token_b
     assert active_b.status == AttemptStatus.CLAIMED.value
-

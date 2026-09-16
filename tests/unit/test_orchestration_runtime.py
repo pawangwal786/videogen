@@ -42,6 +42,7 @@ async def test_orchestrator_not_found_errors():
         wf_repo = AsyncMock()
         mock_wf_repo_cls.return_value = wf_repo
         wf_repo.get_workflow.return_value = None
+        wf_repo.get_workflow_for_update.return_value = None
 
         assert await orchestrator.get_workflow("missing-id") is None
 
@@ -75,6 +76,7 @@ async def test_orchestrator_advance_terminal_status_early_return():
         wf_repo = AsyncMock()
         mock_wf_repo_cls.return_value = wf_repo
         wf_repo.get_workflow.return_value = wf_model
+        wf_repo.get_workflow_for_update.return_value = wf_model
 
         result = await orchestrator.advance_workflow("wf-1")
         assert result.status == WorkflowStatus.COMPLETED
@@ -126,6 +128,7 @@ async def test_orchestrator_advance_stage_failures():
             mock_job_repo_cls.return_value = job_repo
 
             wf_repo.get_workflow.return_value = wf_model
+            wf_repo.get_workflow_for_update.return_value = wf_model
             job_repo.list_jobs_for_workflow.return_value = [failed_job]
 
             await orchestrator.advance_workflow(wf_model.id)
@@ -177,6 +180,7 @@ async def test_orchestrator_advance_video_generation_failure():
         mock_job_repo_cls.return_value = job_repo
 
         wf_repo.get_workflow.return_value = wf_model
+        wf_repo.get_workflow_for_update.return_value = wf_model
         job_repo.list_jobs_for_workflow.return_value = [failed_video_job]
 
         await orchestrator.advance_workflow(wf_model.id)

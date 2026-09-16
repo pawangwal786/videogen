@@ -64,7 +64,6 @@ def get_session_factory(
     settings: Settings | None = None,
 ) -> async_sessionmaker[AsyncSession]:
     """Return the active session factory, initializing if needed."""
-    global _session_factory
     if _session_factory is None:
         return init_db(settings=settings)
     return _session_factory
@@ -91,7 +90,7 @@ async def get_db_session(
     factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> AsyncIterator[AsyncSession]:
     """Provide a transactional AsyncSession scope.
-    
+
     Commits on normal exit, rolls back on exception, and guarantees closure.
     """
     session_maker = factory or get_session_factory()

@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime, Index, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -63,6 +63,4 @@ class WorkflowModel(Base, TimestampMixin):
         cascade="all, delete-orphan",
     )
 
-    __table_args__ = (
-        Index("ix_workflows_status_stage", "status", "current_stage"),
-    )
+    __table_args__ = (Index("ix_workflows_status_stage", "status", "current_stage"),)

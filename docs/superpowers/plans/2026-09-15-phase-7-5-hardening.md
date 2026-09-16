@@ -53,7 +53,10 @@ In `app/repositories/job.py`:
 ```python
 def is_unique_violation(exc: IntegrityError, constraint_hint: str | None = None) -> bool:
     orig = getattr(exc, "orig", None)
-    sqlstate = getattr(orig, "sqlstate", None) or getattr(getattr(orig, "pgcode", None), "__str__", lambda: "")()
+    sqlstate = (
+        getattr(orig, "sqlstate", None)
+        or getattr(getattr(orig, "pgcode", None), "__str__", lambda: "")()
+    )
     if sqlstate == "23505":  # PostgreSQL unique_violation
         if constraint_hint and hasattr(orig, "diag") and orig.diag.constraint_name:
             return constraint_hint in orig.diag.constraint_name
@@ -152,9 +155,10 @@ Run: `uv run pytest tests/unit/test_video_service.py -k test_veo_reconciler -v`
 In `app/orchestration/recovery.py`:
 ```python
 class ReconciliationStatus(str, Enum):
-    RESOLVED = "resolved"              # operation ID identified; caller resumes polling
+    RESOLVED = "resolved"  # operation ID identified; caller resumes polling
     CONFIRMED_ABSENT = "confirmed_absent"  # authoritative provider proof request never reached it
-    UNRESOLVED = "unresolved"          # cannot authoritatively determine external status
+    UNRESOLVED = "unresolved"  # cannot authoritatively determine external status
+
 
 @dataclass(frozen=True)
 class ReconciliationOutcome:

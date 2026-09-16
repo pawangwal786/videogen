@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 class JobModel(Base):
     """Represents a logical unit of execution in a workflow.
-    
+
     A job has a unique logical identity within a workflow (workflow_id, logical_key).
     Execution attempts are tracked separately in JobAttemptModel.
     """
@@ -117,7 +117,7 @@ class JobModel(Base):
 
 class JobAttemptModel(Base):
     """Represents a single execution attempt of a Job.
-    
+
     Contains worker lease ownership (worker_id, lease_token) and external
     provider operation linkage (provider, provider_operation_id, submission_token).
     """

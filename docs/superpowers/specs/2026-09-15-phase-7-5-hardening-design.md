@@ -58,11 +58,7 @@ Add row-locking retrieval:
 ```python
 async def get_workflow_for_update(self, workflow_id: str) -> WorkflowModel | None:
     """Retrieve workflow with an exclusive row-level lock (FOR UPDATE)."""
-    stmt = (
-        select(WorkflowModel)
-        .where(WorkflowModel.id == workflow_id)
-        .with_for_update()
-    )
+    stmt = select(WorkflowModel).where(WorkflowModel.id == workflow_id).with_for_update()
     result = await self._session.execute(stmt)
     return result.scalar_one_or_none()
 ```
@@ -103,9 +99,10 @@ Update `advance_workflow(workflow_id: str)`:
 Define the reconciliation contract:
 ```python
 class ReconciliationStatus(str, Enum):
-    RESOLVED = "resolved"              # provider_operation_id found; caller resumes polling
+    RESOLVED = "resolved"  # provider_operation_id found; caller resumes polling
     CONFIRMED_ABSENT = "confirmed_absent"  # Authoritative proof provider never received request
-    UNRESOLVED = "unresolved"          # External status cannot be authoritatively determined
+    UNRESOLVED = "unresolved"  # External status cannot be authoritatively determined
+
 
 @dataclass(frozen=True)
 class ReconciliationOutcome:

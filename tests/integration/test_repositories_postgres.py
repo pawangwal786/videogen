@@ -2,7 +2,7 @@
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -57,7 +57,9 @@ async def test_workflow_repository_lifecycle(db_session: AsyncSession):
     await db_session.commit()
 
     # Valid transitions
-    updated = await repo.update_status(wf.id, WorkflowStatus.RUNNING.value, current_stage=JobStage.SCRIPT.value)
+    updated = await repo.update_status(
+        wf.id, WorkflowStatus.RUNNING.value, current_stage=JobStage.SCRIPT.value
+    )
     await db_session.commit()
     assert updated.status == WorkflowStatus.RUNNING.value
     assert updated.current_stage == JobStage.SCRIPT.value
@@ -222,7 +224,7 @@ async def test_job_retry_and_max_attempts(db_session: AsyncSession):
     # Attempt 1: fail retryable
     claim1 = await job_repo.claim_next_job(worker_id="worker-1")
     assert claim1 is not None
-    j1, a1 = claim1
+    _j1, a1 = claim1
     assert a1.attempt_number == 1
 
     failed_job, _ = await job_repo.fail_job(
@@ -239,7 +241,7 @@ async def test_job_retry_and_max_attempts(db_session: AsyncSession):
     # Attempt 2: claim again
     claim2 = await job_repo.claim_next_job(worker_id="worker-2")
     assert claim2 is not None
-    j2, a2 = claim2
+    _j2, a2 = claim2
     assert a2.attempt_number == 2
 
     # Fail attempt 2 (reaches max_attempts 2) -> marks job terminally FAILED
@@ -265,7 +267,7 @@ async def test_find_expired_leases(db_session: AsyncSession):
     job_repo = JobRepository(db_session)
 
     wf = await wf_repo.create_workflow(topic="Expired Lease Test")
-    job = await job_repo.create_job(
+    await job_repo.create_job(
         workflow_id=wf.id,
         logical_key="storyboard",
         job_type="storyboard",
@@ -279,7 +281,7 @@ async def test_find_expired_leases(db_session: AsyncSession):
     _, attempt = claim
 
     # Backdate heartbeat_at by 120 seconds
-    attempt.heartbeat_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    attempt.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
     await db_session.commit()
 
     expired = await job_repo.find_expired_leases(lease_timeout_seconds=60.0)
@@ -332,7 +334,10 @@ async def test_artifact_repository_operations(db_session: AsyncSession):
     assert updated.lifecycle_status == ArtifactLifecycleStatus.PURGED.value
 
     # Update non-existent artifact
-    assert await art_repo.update_lifecycle_status("non-existent", ArtifactLifecycleStatus.FAILED.value) is None
+    assert (
+        await art_repo.update_lifecycle_status("non-existent", ArtifactLifecycleStatus.FAILED.value)
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -412,7 +417,9 @@ async def test_repository_edge_cases_and_queries(db_session: AsyncSession):
 
 @pytest.mark.asyncio
 async def test_concurrent_create_same_logical_job(pg_engine: AsyncEngine):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     async with session_factory() as session:
         wf_repo = WorkflowRepository(session)
         wf = await wf_repo.create_workflow(topic="Concurrent Job Test")
@@ -444,7 +451,9 @@ async def test_concurrent_create_same_logical_job(pg_engine: AsyncEngine):
 
 @pytest.mark.asyncio
 async def test_concurrent_create_same_idempotency_key(pg_engine: AsyncEngine):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     key = f"idemp-concurrent-{uuid.uuid4()}"
 
     async def create_wf_task():

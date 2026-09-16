@@ -1,7 +1,7 @@
 """Integration tests for RecoveryWorker against PostgreSQL 16."""
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -52,7 +52,9 @@ async def test_recovery_worker_reclaims_crashed_worker_lease(
     pg_engine: AsyncEngine,
     db_session: AsyncSession,
 ):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     wf_repo = WorkflowRepository(db_session)
     job_repo = JobRepository(db_session)
 
@@ -74,7 +76,7 @@ async def test_recovery_worker_reclaims_crashed_worker_lease(
     _, attempt = claim
 
     # Backdate heartbeat
-    attempt.heartbeat_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    attempt.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
     await db_session.commit()
 
     # Run recovery
@@ -98,7 +100,9 @@ async def test_recovery_worker_reconciles_submission_pending_found(
     pg_engine: AsyncEngine,
     db_session: AsyncSession,
 ):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     wf_repo = WorkflowRepository(db_session)
     job_repo = JobRepository(db_session)
 
@@ -125,7 +129,7 @@ async def test_recovery_worker_reconciles_submission_pending_found(
         lease_token=attempt.lease_token,
         provider="veo",
     )
-    attempt.heartbeat_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    attempt.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
     await db_session.commit()
 
     # Setup recovery with Veo reconciler that finds the operation
@@ -153,7 +157,9 @@ async def test_recovery_worker_handles_ambiguous_submission_pending_safely(
     Ambiguous submissions do NOT blindly generate duplicates; they require reconciliation or fail safely.
     Zero-retry terminal ambiguity must remain persistent across repeated recovery invocations.
     """
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     wf_repo = WorkflowRepository(db_session)
     job_repo = JobRepository(db_session)
 
@@ -180,7 +186,7 @@ async def test_recovery_worker_handles_ambiguous_submission_pending_safely(
         lease_token=attempt.lease_token,
         provider="veo",
     )
-    attempt.heartbeat_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    attempt.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
     await db_session.commit()
 
     # Recovery invocation #1: ambiguous error yields terminal failure
@@ -224,7 +230,9 @@ async def test_recovery_worker_handles_confirmed_absent_reschedules(
     pg_engine: AsyncEngine,
     db_session: AsyncSession,
 ):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     wf_repo = WorkflowRepository(db_session)
     job_repo = JobRepository(db_session)
 
@@ -250,7 +258,7 @@ async def test_recovery_worker_handles_confirmed_absent_reschedules(
         lease_token=attempt.lease_token,
         provider="mock_absent_provider",
     )
-    attempt.heartbeat_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    attempt.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
     await db_session.commit()
 
     worker = RecoveryWorker(session_factory=session_factory, lease_timeout_seconds=30.0)
@@ -270,7 +278,9 @@ async def test_recovery_worker_handles_confirmed_absent_reschedules(
 
 @pytest.mark.asyncio
 async def test_recovery_worker_start_stop(pg_engine: AsyncEngine):
-    session_factory = async_sessionmaker(bind=pg_engine, class_=AsyncSession, expire_on_commit=False)
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
     worker = RecoveryWorker(session_factory=session_factory, lease_timeout_seconds=1.0)
     await worker.start(interval_seconds=0.05)
     await asyncio.sleep(0.1)
