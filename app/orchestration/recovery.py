@@ -271,7 +271,9 @@ class RecoveryWorker:
                 active_claims.pop(candidate["attempt_id"], None)
 
                 if transient_failure:
-                    # Leave attempt as SUBMISSION_PENDING so subsequent recovery iteration can retry
+                    # Deliberately relinquish recovery ownership by stopping heartbeats.
+                    # The attempt remains SUBMISSION_PENDING and will naturally expire its lease
+                    # so that a future recovery cycle (or another worker) can reclaim and retry it.
                     continue
 
                 # Phase C: Conditionally apply outcome using recovery ownership fencing

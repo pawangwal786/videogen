@@ -4,11 +4,13 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.db.base import utc_now
+from app.db.models.job import JobAttemptModel
 from app.db.session import get_session_factory
 from app.logging import get_logger
 from app.orchestration.errors import WorkflowNotFoundError
 from app.orchestration.models import Artifact, Workflow
-from app.orchestration.state_machine import JobStage, JobStatus, WorkflowStatus
+from app.orchestration.state_machine import AttemptStatus, JobStage, JobStatus, WorkflowStatus
 from app.repositories.artifact import ArtifactRepository
 from app.repositories.job import JobRepository
 from app.repositories.workflow import WorkflowRepository
@@ -118,7 +120,8 @@ class WorkflowOrchestrator:
 
             await wf_repo.update_status(workflow_id, status=WorkflowStatus.CANCELLED.value)
 
-            # Cancel all non-completed jobs
+            # Cancel all non-completed jobs and fence their active attempts
+            now = utc_now()
             jobs = await job_repo.list_jobs_for_workflow(workflow_id)
             for j in jobs:
                 if j.status not in {
@@ -127,6 +130,15 @@ class WorkflowOrchestrator:
                     JobStatus.CANCELLED.value,
                 }:
                     j.status = JobStatus.CANCELLED.value
+                    if j.current_attempt_id:
+                        att = await session.get(JobAttemptModel, j.current_attempt_id)
+                        if att is not None and att.status in {
+                            AttemptStatus.CLAIMED.value,
+                            AttemptStatus.SUBMISSION_PENDING.value,
+                            AttemptStatus.RUNNING.value,
+                        }:
+                            att.status = AttemptStatus.CANCELLED.value
+                            att.completed_at = now
 
             await session.commit()
             return Workflow.model_validate(wf_model)
@@ -167,14 +179,7 @@ class WorkflowOrchestrator:
 
             if current_stage == JobStage.RESEARCH:
                 r_job = jobs_by_key.get("research")
-                if r_job and r_job.status == JobStatus.FAILED.value:
-                    await wf_repo.update_status(
-                        workflow_id,
-                        status=WorkflowStatus.FAILED.value,
-                        error_code=r_job.error_code,
-                        error_message=r_job.error_message,
-                    )
-                elif r_job and r_job.status == JobStatus.COMPLETED.value:
+                if r_job and r_job.status == JobStatus.COMPLETED.value:
                     if "script" not in jobs_by_key:
                         await job_repo.create_job(
                             workflow_id=workflow_id,
@@ -194,14 +199,7 @@ class WorkflowOrchestrator:
 
             elif current_stage == JobStage.SCRIPT:
                 s_job = jobs_by_key.get("script")
-                if s_job and s_job.status == JobStatus.FAILED.value:
-                    await wf_repo.update_status(
-                        workflow_id,
-                        status=WorkflowStatus.FAILED.value,
-                        error_code=s_job.error_code,
-                        error_message=s_job.error_message,
-                    )
-                elif s_job and s_job.status == JobStatus.COMPLETED.value:
+                if s_job and s_job.status == JobStatus.COMPLETED.value:
                     if "storyboard" not in jobs_by_key:
                         await job_repo.create_job(
                             workflow_id=workflow_id,
@@ -220,14 +218,7 @@ class WorkflowOrchestrator:
 
             elif current_stage == JobStage.STORYBOARD:
                 sb_job = jobs_by_key.get("storyboard")
-                if sb_job and sb_job.status == JobStatus.FAILED.value:
-                    await wf_repo.update_status(
-                        workflow_id,
-                        status=WorkflowStatus.FAILED.value,
-                        error_code=sb_job.error_code,
-                        error_message=sb_job.error_message,
-                    )
-                elif sb_job and sb_job.status == JobStatus.COMPLETED.value:
+                if sb_job and sb_job.status == JobStatus.COMPLETED.value:
                     shots = sb_job.output_payload.get("shots", []) if sb_job.output_payload else []
                     aspect_ratio = (
                         sb_job.output_payload.get("aspect_ratio", "9:16")
@@ -259,20 +250,11 @@ class WorkflowOrchestrator:
 
             elif current_stage == JobStage.VIDEO_GENERATION:
                 video_jobs = [j for k, j in jobs_by_key.items() if k.startswith("video:shot:")]
-                any_failed = any(j.status == JobStatus.FAILED.value for j in video_jobs)
                 all_completed = len(video_jobs) > 0 and all(
                     j.status == JobStatus.COMPLETED.value for j in video_jobs
                 )
 
-                if any_failed:
-                    first_fail = next(j for j in video_jobs if j.status == JobStatus.FAILED.value)
-                    await wf_repo.update_status(
-                        workflow_id,
-                        status=WorkflowStatus.FAILED.value,
-                        error_code=first_fail.error_code,
-                        error_message=first_fail.error_message,
-                    )
-                elif all_completed:
+                if all_completed:
                     if "media_assembly" not in jobs_by_key:
                         shot_outputs = [
                             j.output_payload
@@ -296,14 +278,7 @@ class WorkflowOrchestrator:
 
             elif current_stage == JobStage.MEDIA_ASSEMBLY:
                 assembly_job = jobs_by_key.get("media_assembly")
-                if assembly_job and assembly_job.status == JobStatus.FAILED.value:
-                    await wf_repo.update_status(
-                        workflow_id,
-                        status=WorkflowStatus.FAILED.value,
-                        error_code=assembly_job.error_code,
-                        error_message=assembly_job.error_message,
-                    )
-                elif assembly_job and assembly_job.status == JobStatus.COMPLETED.value:
+                if assembly_job and assembly_job.status == JobStatus.COMPLETED.value:
                     await wf_repo.update_status(
                         workflow_id,
                         status=WorkflowStatus.COMPLETED.value,

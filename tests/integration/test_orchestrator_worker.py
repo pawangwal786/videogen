@@ -597,3 +597,96 @@ async def test_failed_attempt_does_not_reuse_provider_operation(
         assert final_j.attempts[0].provider_operation_id == "operations/veo-old-fail-123"
         assert final_j.attempts[1].status == AttemptStatus.COMPLETED.value
         assert final_j.attempts[1].provider_operation_id == "operations/veo-new-success-456"
+
+
+@pytest.mark.asyncio
+async def test_workflow_cancellation_fences_active_worker_mutations(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Verify that cancelling a workflow cancels active job attempts and fences subsequent worker mutations."""
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    orchestrator = WorkflowOrchestrator(session_factory)
+
+    # 1. Create a workflow with an initial pending job
+    wf = await orchestrator.create_workflow(topic="Test Cancellation Fencing")
+    wf_id = wf.id
+
+    # 2. Worker claims the job
+    worker_id = "test-worker-cancellation"
+    token = str(uuid.uuid4())
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        claim = await job_repo.claim_next_job(worker_id=worker_id, lease_token=token)
+        assert claim is not None
+        job, attempt = claim
+        job_id = job.id
+        attempt_id = attempt.id
+        await session.commit()
+
+    # Verify job and attempt are initially active
+    async with session_factory() as session:
+        j = await session.get(JobModel, job_id)
+        assert j is not None
+        assert j.status == JobStatus.CLAIMED.value
+        att = await session.get(JobAttemptModel, attempt_id)
+        assert att is not None
+        assert att.status == AttemptStatus.CLAIMED.value
+
+    # 3. Cancel the workflow via orchestrator
+    cancelled_wf = await orchestrator.cancel_workflow(wf_id)
+    assert cancelled_wf.status == WorkflowStatus.CANCELLED
+
+    # Verify both job and attempt are CANCELLED in DB
+    async with session_factory() as session:
+        j = await session.get(JobModel, job_id)
+        assert j is not None
+        assert j.status == JobStatus.CANCELLED.value
+        att = await session.get(JobAttemptModel, attempt_id)
+        assert att is not None
+        assert att.status == AttemptStatus.CANCELLED.value
+
+    # 4. Worker tries heartbeat -> rejected with LeaseConflictError
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        with pytest.raises(LeaseConflictError):
+            await job_repo.heartbeat_attempt(
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=token,
+            )
+
+    # 5. Worker tries completion -> rejected with LeaseConflictError
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        with pytest.raises(LeaseConflictError):
+            await job_repo.complete_job(
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=token,
+                output_payload={"status": "done"},
+            )
+
+    # 6. Worker tries failure -> rejected with LeaseConflictError
+    async with session_factory() as session:
+        job_repo = JobRepository(session)
+        with pytest.raises(LeaseConflictError):
+            await job_repo.fail_job(
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=token,
+                error_code="WORKER_FAIL",
+                error_message="Worker error",
+                retryable=False,
+            )
+
+    # 7. Verify CANCELLED state remains authoritative in the DB
+    async with session_factory() as session:
+        j = await session.get(JobModel, job_id)
+        assert j is not None
+        assert j.status == JobStatus.CANCELLED.value
+        att = await session.get(JobAttemptModel, attempt_id)
+        assert att is not None
+        assert att.status == AttemptStatus.CANCELLED.value

@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -104,64 +104,65 @@ class JobRepository:
         lease_token: str | None = None,
     ) -> tuple[JobModel, JobAttemptModel] | None:
         """Atomically claim the next eligible PENDING job using SELECT FOR UPDATE SKIP LOCKED."""
-        now = utc_now()
-        stmt = (
-            select(JobModel)
-            .where(
-                JobModel.status == JobStatus.PENDING.value,
-                JobModel.available_at <= now,
+        while True:
+            now = utc_now()
+            stmt = (
+                select(JobModel)
+                .where(
+                    JobModel.status == JobStatus.PENDING.value,
+                    JobModel.available_at <= now,
+                )
+                .order_by(JobModel.available_at.asc(), JobModel.created_at.asc())
+                .limit(1)
+                .with_for_update(skip_locked=True)
             )
-            .order_by(JobModel.available_at.asc(), JobModel.created_at.asc())
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-        result = await self._session.execute(stmt)
-        job = result.scalar_one_or_none()
-        if job is None:
-            return None
+            result = await self._session.execute(stmt)
+            job = result.scalar_one_or_none()
+            if job is None:
+                return None
 
-        # Determine attempt number
-        max_att_stmt = select(func.max(JobAttemptModel.attempt_number)).where(
-            JobAttemptModel.job_id == job.id
-        )
-        current_max = (await self._session.execute(max_att_stmt)).scalar() or 0
-        attempt_number = current_max + 1
+            # Determine attempt number
+            max_att_stmt = select(func.max(JobAttemptModel.attempt_number)).where(
+                JobAttemptModel.job_id == job.id
+            )
+            current_max = (await self._session.execute(max_att_stmt)).scalar() or 0
+            attempt_number = current_max + 1
 
-        # Check if attempts exceeded max allowed
-        if attempt_number > job.max_attempts:
-            job.status = JobStatus.FAILED.value
-            job.error_code = "MAX_ATTEMPTS_EXCEEDED"
-            job.error_message = f"Exceeded max attempts ({current_max}/{job.max_attempts})"
-            job.completed_at = now
+            # Check if attempts exceeded max allowed
+            if attempt_number > job.max_attempts:
+                job.status = JobStatus.FAILED.value
+                job.error_code = "MAX_ATTEMPTS_EXCEEDED"
+                job.error_message = f"Exceeded max attempts ({current_max}/{job.max_attempts})"
+                job.completed_at = now
+                await self._session.flush()
+                # Continue searching for next eligible job iteratively
+                continue
+
+            token = lease_token or str(uuid.uuid4())
+            submission_token = f"{job.workflow_id}:{job.logical_key}:{attempt_number}"
+
+            attempt = JobAttemptModel(
+                job_id=job.id,
+                attempt_number=attempt_number,
+                worker_id=worker_id,
+                lease_token=token,
+                status=AttemptStatus.CLAIMED.value,
+                started_at=now,
+                heartbeat_at=now,
+                submission_token=submission_token,
+                request_payload=job.input_payload,
+            )
+            self._session.add(attempt)
             await self._session.flush()
-            # Attempt next available job
-            return await self.claim_next_job(worker_id, lease_token)
 
-        token = lease_token or str(uuid.uuid4())
-        submission_token = f"{job.workflow_id}:{job.logical_key}:{attempt_number}"
+            job.status = JobStatus.CLAIMED.value
+            job.current_attempt_id = attempt.id
+            if job.started_at is None:
+                job.started_at = now
+            job.version += 1
+            await self._session.flush()
 
-        attempt = JobAttemptModel(
-            job_id=job.id,
-            attempt_number=attempt_number,
-            worker_id=worker_id,
-            lease_token=token,
-            status=AttemptStatus.CLAIMED.value,
-            started_at=now,
-            heartbeat_at=now,
-            submission_token=submission_token,
-            request_payload=job.input_payload,
-        )
-        self._session.add(attempt)
-        await self._session.flush()
-
-        job.status = JobStatus.CLAIMED.value
-        job.current_attempt_id = attempt.id
-        if job.started_at is None:
-            job.started_at = now
-        job.version += 1
-        await self._session.flush()
-
-        return job, attempt
+            return job, attempt
 
     async def get_active_attempt(
         self,
@@ -169,18 +170,32 @@ class JobRepository:
         worker_id: str,
         lease_token: str,
     ) -> JobAttemptModel:
-        """Verify and return the active attempt matching job_id, worker_id, and lease_token."""
-        stmt = select(JobAttemptModel).where(
-            JobAttemptModel.job_id == job_id,
-            JobAttemptModel.worker_id == worker_id,
-            JobAttemptModel.lease_token == lease_token,
-            JobAttemptModel.status.in_(
-                [
-                    AttemptStatus.CLAIMED.value,
-                    AttemptStatus.SUBMISSION_PENDING.value,
-                    AttemptStatus.RUNNING.value,
-                ]
-            ),
+        """Verify and return the active attempt matching job_id, worker_id, and lease_token.
+
+        Also ensures the parent JobModel is in an active state (CLAIMED or RUNNING),
+        fencing workers if the job or workflow was cancelled.
+        """
+        stmt = (
+            select(JobAttemptModel)
+            .join(JobModel, JobAttemptModel.job_id == JobModel.id)
+            .where(
+                JobAttemptModel.job_id == job_id,
+                JobAttemptModel.worker_id == worker_id,
+                JobAttemptModel.lease_token == lease_token,
+                JobAttemptModel.status.in_(
+                    [
+                        AttemptStatus.CLAIMED.value,
+                        AttemptStatus.SUBMISSION_PENDING.value,
+                        AttemptStatus.RUNNING.value,
+                    ]
+                ),
+                JobModel.status.in_(
+                    [
+                        JobStatus.CLAIMED.value,
+                        JobStatus.RUNNING.value,
+                    ]
+                ),
+            )
         )
         attempt = (await self._session.execute(stmt)).scalar_one_or_none()
         if attempt is None:
@@ -424,24 +439,29 @@ class JobRepository:
         recovery_worker_id: str,
         recovery_lease_token: str,
     ) -> bool:
-        """Update heartbeat timestamp for an in-flight recovery claim.
+        """Atomically update heartbeat timestamp for an in-flight recovery claim using a conditional SQL UPDATE.
 
-        Fenced by attempt_id, recovery_worker_id, recovery_lease_token, and status == SUBMISSION_PENDING.
-        Returns True if heartbeat was updated, False if ownership was lost or status changed.
+        Fenced at the SQL execution boundary by:
+        - attempt_id
+        - worker_id == recovery_worker_id
+        - lease_token == recovery_lease_token
+        - status == SUBMISSION_PENDING
+
+        Returns True if exactly 1 row was updated, or False if ownership was lost or status changed.
         """
-        stmt = select(JobAttemptModel).where(
-            JobAttemptModel.id == attempt_id,
-            JobAttemptModel.worker_id == recovery_worker_id,
-            JobAttemptModel.lease_token == recovery_lease_token,
-            JobAttemptModel.status == AttemptStatus.SUBMISSION_PENDING.value,
+        stmt = (
+            update(JobAttemptModel)
+            .where(
+                JobAttemptModel.id == attempt_id,
+                JobAttemptModel.worker_id == recovery_worker_id,
+                JobAttemptModel.lease_token == recovery_lease_token,
+                JobAttemptModel.status == AttemptStatus.SUBMISSION_PENDING.value,
+            )
+            .values(heartbeat_at=utc_now())
         )
         result = await self._session.execute(stmt)
-        attempt = result.scalar_one_or_none()
-        if attempt is None:
-            return False
-        attempt.heartbeat_at = utc_now()
         await self._session.flush()
-        return True
+        return (result.rowcount or 0) > 0
 
     async def apply_recovery_outcome(
         self,

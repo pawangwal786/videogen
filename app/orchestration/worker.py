@@ -200,7 +200,7 @@ class JobWorker:
                     retryable=False,
                 )
                 await session.commit()
-            self._cleanup_active_job()
+            await self._cleanup_active_job()
             return True
 
         try:
@@ -225,7 +225,7 @@ class JobWorker:
             # Worker shutdown requested: abort-and-recover model. Guarantees no new work
             # is claimed and any already-persisted provider state remains recoverable in PostgreSQL.
             logger.info("job_execution_interrupted_shutdown", job_id=job.id)
-            self._cleanup_active_job()
+            await self._cleanup_active_job()
             raise
 
         except Exception as exc:  # noqa: BLE001
@@ -251,15 +251,20 @@ class JobWorker:
             await self._orchestrator.advance_workflow(job.workflow_id)
 
         finally:
-            self._cleanup_active_job()
+            await self._cleanup_active_job()
 
         return True
 
-    def _cleanup_active_job(self) -> None:
-        """Cancel heartbeat task and reset active job tracking."""
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            self._heartbeat_task = None
+    async def _cleanup_active_job(self) -> None:
+        """Cancel and await heartbeat task, then reset active job tracking."""
+        task = self._heartbeat_task
+        self._heartbeat_task = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         self._active_job_id = None
         self._active_lease_token = None
         self._active_attempt_number = None
@@ -300,4 +305,4 @@ class JobWorker:
             except asyncio.CancelledError:
                 pass
             self._main_task = None
-        self._cleanup_active_job()
+        await self._cleanup_active_job()

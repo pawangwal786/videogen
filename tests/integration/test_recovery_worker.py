@@ -768,3 +768,98 @@ async def test_recovery_max_attempts_marks_workflow_failed(
     assert failed_wf_2 is not None
     assert failed_wf_2.status == WorkflowStatus.FAILED.value
     assert failed_wf_2.error_code == "MAX_ATTEMPTS_EXCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_heartbeat_fails_atomically_on_ownership_change(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Verify that heartbeat_recovery_claim is fenced by atomic conditional SQL UPDATE.
+
+    If ownership changes A -> B concurrently, A's subsequent heartbeat call affects 0 rows,
+    returns False, and cannot mutate or revive B's claim.
+    """
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    wf_repo = WorkflowRepository(db_session)
+    job_repo = JobRepository(db_session)
+
+    # 1. Create workflow and job
+    wf = await wf_repo.create_workflow(topic="Stale Recovery Heartbeat Race")
+    wf_id = wf.id
+    job = await job_repo.create_job(
+        workflow_id=wf_id,
+        logical_key="research",
+        job_type="research",
+        stage=JobStage.RESEARCH.value,
+        input_payload={"topic": "Race Topic"},
+    )
+    job_id = job.id
+    await db_session.commit()
+
+    # 2. Worker claims job and moves attempt to SUBMISSION_PENDING
+    claim = await job_repo.claim_next_job(worker_id="initial-worker")
+    assert claim is not None
+    _, attempt = claim
+    attempt_id = attempt.id
+
+    await job_repo.record_submission_pending(
+        job_id=job_id,
+        worker_id="initial-worker",
+        lease_token=attempt.lease_token,
+        provider="mock_provider",
+    )
+    await db_session.commit()
+
+    # 3. Recovery Worker A claims the attempt
+    token_a = "recovery-token-a"
+    attempt.worker_id = "recovery-worker-a"
+    attempt.lease_token = token_a
+    heartbeat_time_a = datetime.now(UTC) - timedelta(seconds=10)
+    attempt.heartbeat_at = heartbeat_time_a
+    await db_session.commit()
+
+    # Verify initial valid heartbeat from A succeeds and updates heartbeat_at
+    heartbeat_a_ok = await job_repo.heartbeat_recovery_claim(
+        attempt_id=attempt_id,
+        recovery_worker_id="recovery-worker-a",
+        recovery_lease_token=token_a,
+    )
+    assert heartbeat_a_ok is True
+    await db_session.commit()
+
+    db_session.expire_all()
+    reloaded_att = await db_session.get(JobAttemptModel, attempt_id)
+    assert reloaded_att is not None
+    assert reloaded_att.heartbeat_at > heartbeat_time_a
+
+    # 4. Recovery Worker B acquires recovery row lock and changes ownership A -> B
+    token_b = "recovery-token-b"
+    heartbeat_time_b = datetime.now(UTC) - timedelta(seconds=5)
+    async with session_factory() as session_b:
+        att_b = await session_b.get(JobAttemptModel, attempt_id)
+        assert att_b is not None
+        att_b.worker_id = "recovery-worker-b"
+        att_b.lease_token = token_b
+        att_b.heartbeat_at = heartbeat_time_b
+        await session_b.commit()
+
+    # 5. Stale Recovery Worker A's heartbeat executes
+    # With atomic SQL UPDATE, it must fail (return False, 0 rows affected)
+    stale_heartbeat_ok = await job_repo.heartbeat_recovery_claim(
+        attempt_id=attempt_id,
+        recovery_worker_id="recovery-worker-a",
+        recovery_lease_token=token_a,
+    )
+    assert stale_heartbeat_ok is False
+    await db_session.commit()
+
+    # 6. Verify B's ownership and state remain authoritative and completely uncorrupted
+    db_session.expire_all()
+    final_att = await db_session.get(JobAttemptModel, attempt_id)
+    assert final_att is not None
+    assert final_att.worker_id == "recovery-worker-b"
+    assert final_att.lease_token == token_b
+    assert final_att.heartbeat_at == heartbeat_time_b
