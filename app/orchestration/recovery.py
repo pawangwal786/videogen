@@ -1,7 +1,9 @@
 """Recovery worker for detecting expired leases and reconciling ambiguous submissions."""
 
 import asyncio
-from typing import Protocol
+import uuid
+from datetime import timedelta
+from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -56,10 +58,12 @@ class RecoveryWorker:
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         lease_timeout_seconds: float = 60.0,
         reconcilers: dict[str, ProviderReconciler] | None = None,
+        worker_id: str | None = None,
     ) -> None:
         self._session_factory = session_factory or get_session_factory()
         self._lease_timeout_seconds = lease_timeout_seconds
         self._reconcilers = reconcilers or {}
+        self.worker_id = worker_id or f"recovery-{uuid.uuid4().hex[:8]}"
         self._running = False
         self._task: asyncio.Task[None] | None = None
 
@@ -68,18 +72,40 @@ class RecoveryWorker:
         self._reconcilers[provider] = reconciler
 
     async def run_once(self) -> RecoveryReport:
-        """Execute a single scan for expired leases and perform recovery transitions."""
+        """Execute a single scan for expired leases and perform recovery transitions.
+
+        Separates execution into three distinct phases:
+        - Phase A: Fast DB transaction using SELECT ... FOR UPDATE SKIP LOCKED.
+          Ordinary expired attempts are marked EXPIRED and rescheduled immediately.
+          SUBMISSION_PENDING attempts are atomically claimed by establishing durable
+          recovery ownership (worker_id + new recovery_lease_token + heartbeat_at = now).
+        - Phase B: External provider reconciliation executed completely outside any DB session.
+        - Phase C: Fenced DB transaction applying the reconciliation outcome conditionally.
+          If ownership was lost (0 rows affected), the advisory outcome is discarded.
+        """
+        cutoff = utc_now() - timedelta(seconds=self._lease_timeout_seconds)
+        rescheduled = 0
+        failed = 0
+        ambiguous = 0
+        recovered_ids: list[str] = []
+        expired_count = 0
+
+        reconciliation_candidates: list[dict[str, Any]] = []
+
+        # ------------------------------------------------------------------
+        # Phase A: Fast DB transaction claiming expired work
+        # ------------------------------------------------------------------
         async with self._session_factory() as session:
             job_repo = JobRepository(session)
-            expired_attempts = await job_repo.find_expired_leases(self._lease_timeout_seconds)
+            expired_attempts = await job_repo.find_expired_leases(
+                self._lease_timeout_seconds, for_update=True
+            )
 
             if not expired_attempts:
                 return RecoveryReport()
 
-            rescheduled = 0
-            failed = 0
-            ambiguous = 0
-            recovered_ids: list[str] = []
+            expired_count = len(expired_attempts)
+            now = utc_now()
 
             for attempt in expired_attempts:
                 job = await job_repo.get_job(attempt.job_id)
@@ -89,112 +115,31 @@ class RecoveryWorker:
                 }:
                     continue
 
-                now = utc_now()
-
-                # Ambiguous external submission recovery
                 if attempt.status == AttemptStatus.SUBMISSION_PENDING.value:
-                    provider = attempt.provider
-                    reconciler = self._reconcilers.get(provider) if provider else None
-
-                    outcome: ReconciliationOutcome | None = None
-                    transient_failure = False
-
-                    if reconciler is not None:
-                        try:
-                            outcome = await reconciler.reconcile_submission(
-                                attempt.submission_token,
-                                attempt.provider_operation_id,
-                            )
-                        except (ModelTimeoutError, ModelRateLimitError, TimeoutError) as exc:
-                            logger.warning(
-                                "reconciliation_transient_error",
-                                attempt_id=attempt.id,
-                                job_id=job.id,
-                                error=str(exc),
-                            )
-                            transient_failure = True
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning(
-                                "reconciliation_failed_unresolved",
-                                attempt_id=attempt.id,
-                                job_id=job.id,
-                                error=str(exc),
-                            )
-                            outcome = ReconciliationOutcome(
-                                status=ReconciliationStatus.UNRESOLVED,
-                                provider_operation_id=attempt.provider_operation_id,
-                                error_message=str(exc),
-                            )
-
-                    if transient_failure:
-                        # Leave attempt as SUBMISSION_PENDING so subsequent recovery iteration can retry
-                        continue
-
-                    if outcome is not None and outcome.status == ReconciliationStatus.RESOLVED:
-                        # Operation was found running on external provider; resume polling
-                        attempt.provider_operation_id = outcome.provider_operation_id
-                        attempt.status = AttemptStatus.RUNNING.value
-                        attempt.heartbeat_at = now
-                        job.status = JobStatus.RUNNING.value
-                        job.version += 1
-                        rescheduled += 1
-                        recovered_ids.append(job.id)
-                    elif (
-                        outcome is not None
-                        and outcome.status == ReconciliationStatus.CONFIRMED_ABSENT
-                    ):
-                        # Confirmed that provider never received it; safe to mark attempt expired and reschedule
-                        attempt.status = AttemptStatus.EXPIRED.value
-                        attempt.completed_at = now
-                        if attempt.attempt_number < job.max_attempts:
-                            job.status = JobStatus.PENDING.value
-                            job.available_at = compute_next_available_at(attempt.attempt_number)
-                            job.version += 1
-                            rescheduled += 1
-                            recovered_ids.append(job.id)
-                        else:
-                            job.status = JobStatus.FAILED.value
-                            job.completed_at = now
-                            job.error_code = "MAX_ATTEMPTS_EXCEEDED"
-                            job.error_message = f"Exceeded max attempts ({attempt.attempt_number}/{job.max_attempts})"
-                            job.version += 1
-                            failed += 1
-                    else:
-                        # Ambiguous / UNRESOLVED: do not blindly generate duplicate; zero automated retries!
-                        error_code = "AMBIGUOUS_SUBMISSION_REQUIRES_MANUAL_RECONCILIATION"
-                        error_message = (
-                            f"Worker crashed during ambiguous submission. "
-                            f"Submission token: {attempt.submission_token}. Requires manual/provider reconciliation."
+                    # Atomically claim for recovery by establishing durable ownership fencing
+                    recovery_lease_token = str(uuid.uuid4())
+                    claimed = await job_repo.claim_expired_attempt_for_recovery(
+                        attempt_id=attempt.id,
+                        recovery_worker_id=self.worker_id,
+                        recovery_lease_token=recovery_lease_token,
+                        cutoff=cutoff,
+                    )
+                    if claimed is not None:
+                        reconciliation_candidates.append(
+                            {
+                                "attempt_id": attempt.id,
+                                "job_id": job.id,
+                                "workflow_id": job.workflow_id,
+                                "max_attempts": job.max_attempts,
+                                "attempt_number": attempt.attempt_number,
+                                "provider": attempt.provider,
+                                "submission_token": attempt.submission_token,
+                                "provider_operation_id": attempt.provider_operation_id,
+                                "recovery_lease_token": recovery_lease_token,
+                            }
                         )
-                        attempt.status = AttemptStatus.FAILED.value
-                        attempt.completed_at = now
-                        attempt.error_code = error_code
-                        attempt.error_message = error_message
-
-                        job.status = JobStatus.FAILED.value
-                        job.completed_at = now
-                        job.error_code = error_code
-                        job.error_message = error_message
-                        job.version += 1
-
-                        wf_repo = WorkflowRepository(session)
-                        try:
-                            await wf_repo.update_status(
-                                job.workflow_id,
-                                status=WorkflowStatus.FAILED.value,
-                                error_code=error_code,
-                                error_message=error_message,
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            logger.error(
-                                "failed_to_update_workflow_status_on_ambiguity", error=str(exc)
-                            )
-
-                        ambiguous += 1
-                        failed += 1
-
                 else:
-                    # Normal worker crash or missing heartbeat
+                    # Ordinary worker crash or missing heartbeat (CLAIMED or RUNNING)
                     attempt.status = AttemptStatus.EXPIRED.value
                     attempt.completed_at = now
 
@@ -216,13 +161,177 @@ class RecoveryWorker:
                         failed += 1
 
             await session.commit()
-            return RecoveryReport(
-                expired_attempts_detected=len(expired_attempts),
-                jobs_rescheduled=rescheduled,
-                jobs_terminally_failed=failed,
-                ambiguous_reconciliations=ambiguous,
-                recovered_job_ids=recovered_ids,
-            )
+
+        # ------------------------------------------------------------------
+        # Phase B & Phase C: Decoupled reconciliation and fenced application
+        # ------------------------------------------------------------------
+        for candidate in reconciliation_candidates:
+            provider = candidate["provider"]
+            reconciler = self._reconcilers.get(provider) if provider else None
+            outcome: ReconciliationOutcome | None = None
+            transient_failure = False
+
+            if reconciler is not None:
+                try:
+                    outcome = await reconciler.reconcile_submission(
+                        candidate["submission_token"],
+                        candidate["provider_operation_id"],
+                    )
+                except (ModelTimeoutError, ModelRateLimitError, TimeoutError) as exc:
+                    logger.warning(
+                        "reconciliation_transient_error",
+                        attempt_id=candidate["attempt_id"],
+                        job_id=candidate["job_id"],
+                        error=str(exc),
+                    )
+                    transient_failure = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "reconciliation_failed_unresolved",
+                        attempt_id=candidate["attempt_id"],
+                        job_id=candidate["job_id"],
+                        error=str(exc),
+                    )
+                    outcome = ReconciliationOutcome(
+                        status=ReconciliationStatus.UNRESOLVED,
+                        provider_operation_id=candidate["provider_operation_id"],
+                        error_message=str(exc),
+                    )
+            else:
+                outcome = ReconciliationOutcome(
+                    status=ReconciliationStatus.UNRESOLVED,
+                    provider_operation_id=candidate["provider_operation_id"],
+                    error_message=f"No reconciler registered for provider '{provider}'",
+                )
+
+            if transient_failure:
+                # Leave attempt as SUBMISSION_PENDING so subsequent recovery iteration can retry
+                continue
+
+            # Phase C: Conditionally apply outcome using recovery ownership fencing
+            now = utc_now()
+            async with self._session_factory() as session:
+                job_repo = JobRepository(session)
+                job = await job_repo.get_job(candidate["job_id"])
+                if job is None:
+                    continue
+
+                if outcome is not None and outcome.status == ReconciliationStatus.RESOLVED:
+                    applied = await job_repo.apply_recovery_outcome(
+                        attempt_id=candidate["attempt_id"],
+                        recovery_worker_id=self.worker_id,
+                        recovery_lease_token=candidate["recovery_lease_token"],
+                        new_attempt_status=AttemptStatus.EXPIRED.value,
+                        completed_at=now,
+                        provider_operation_id=outcome.provider_operation_id,
+                    )
+                    if applied is None:
+                        logger.warning(
+                            "recovery_outcome_discarded_ownership_lost",
+                            attempt_id=candidate["attempt_id"],
+                        )
+                        continue
+
+                    # Reschedule job to PENDING with immediate availability for Worker B to claim
+                    if candidate["attempt_number"] < candidate["max_attempts"]:
+                        job.status = JobStatus.PENDING.value
+                        job.available_at = now
+                        job.version += 1
+                        rescheduled += 1
+                        recovered_ids.append(job.id)
+                    else:
+                        job.status = JobStatus.FAILED.value
+                        job.completed_at = now
+                        job.error_code = "MAX_ATTEMPTS_EXCEEDED"
+                        job.error_message = f"Exceeded max attempts ({candidate['attempt_number']}/{candidate['max_attempts']})"
+                        job.version += 1
+                        failed += 1
+
+                elif (
+                    outcome is not None and outcome.status == ReconciliationStatus.CONFIRMED_ABSENT
+                ):
+                    applied = await job_repo.apply_recovery_outcome(
+                        attempt_id=candidate["attempt_id"],
+                        recovery_worker_id=self.worker_id,
+                        recovery_lease_token=candidate["recovery_lease_token"],
+                        new_attempt_status=AttemptStatus.EXPIRED.value,
+                        completed_at=now,
+                    )
+                    if applied is None:
+                        logger.warning(
+                            "recovery_outcome_discarded_ownership_lost",
+                            attempt_id=candidate["attempt_id"],
+                        )
+                        continue
+
+                    if candidate["attempt_number"] < candidate["max_attempts"]:
+                        job.status = JobStatus.PENDING.value
+                        job.available_at = compute_next_available_at(candidate["attempt_number"])
+                        job.version += 1
+                        rescheduled += 1
+                        recovered_ids.append(job.id)
+                    else:
+                        job.status = JobStatus.FAILED.value
+                        job.completed_at = now
+                        job.error_code = "MAX_ATTEMPTS_EXCEEDED"
+                        job.error_message = f"Exceeded max attempts ({candidate['attempt_number']}/{candidate['max_attempts']})"
+                        job.version += 1
+                        failed += 1
+
+                else:
+                    # UNRESOLVED: terminal failure with zero automated retry
+                    error_code = "AMBIGUOUS_SUBMISSION_REQUIRES_MANUAL_RECONCILIATION"
+                    error_message = (
+                        f"Worker crashed during ambiguous submission. "
+                        f"Submission token: {candidate['submission_token']}. Requires manual/provider reconciliation."
+                    )
+                    applied = await job_repo.apply_recovery_outcome(
+                        attempt_id=candidate["attempt_id"],
+                        recovery_worker_id=self.worker_id,
+                        recovery_lease_token=candidate["recovery_lease_token"],
+                        new_attempt_status=AttemptStatus.FAILED.value,
+                        completed_at=now,
+                        error_code=error_code,
+                        error_message=error_message,
+                    )
+                    if applied is None:
+                        logger.warning(
+                            "recovery_outcome_discarded_ownership_lost",
+                            attempt_id=candidate["attempt_id"],
+                        )
+                        continue
+
+                    job.status = JobStatus.FAILED.value
+                    job.completed_at = now
+                    job.error_code = error_code
+                    job.error_message = error_message
+                    job.version += 1
+
+                    wf_repo = WorkflowRepository(session)
+                    try:
+                        await wf_repo.update_status(
+                            job.workflow_id,
+                            status=WorkflowStatus.FAILED.value,
+                            error_code=error_code,
+                            error_message=error_message,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.error(
+                            "failed_to_update_workflow_status_on_ambiguity", error=str(exc)
+                        )
+
+                    ambiguous += 1
+                    failed += 1
+
+                await session.commit()
+
+        return RecoveryReport(
+            expired_attempts_detected=expired_count,
+            jobs_rescheduled=rescheduled,
+            jobs_terminally_failed=failed,
+            ambiguous_reconciliations=ambiguous,
+            recovered_job_ids=recovered_ids,
+        )
 
     async def start(self, interval_seconds: float = 10.0) -> None:
         """Start background polling loop for expired leases."""

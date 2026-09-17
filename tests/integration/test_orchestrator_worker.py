@@ -324,7 +324,7 @@ async def test_worker_restart_resumes_persisted_provider_operation(
         ) -> dict[str, Any]:
             nonlocal provider_submission_count, poll_count
 
-            existing_op_id = await worker.get_latest_provider_operation_id(job.id)
+            existing_op_id = await worker.get_recoverable_provider_operation_id(job.id)
 
             if existing_op_id is None:
                 # First attempt: submit to provider
@@ -489,3 +489,112 @@ async def test_worker_shutdown_preserves_attempt_and_blocks_stale_mutation(
     assert active_b.worker_id == worker_id_b
     assert active_b.lease_token == lease_token_b
     assert active_b.status == AttemptStatus.CLAIMED.value
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_does_not_reuse_provider_operation(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Verify that a provider operation belonging to a FAILED attempt is NEVER reused on retry.
+    Attempt 1 submits op-old and fails terminally for that attempt (status=FAILED).
+    Attempt 2 claims the retried job:
+    - worker.get_recoverable_provider_operation_id() returns None
+    - op-old poll count is 0 after new attempt begins
+    - provider receives a brand new submission (op-new).
+    """
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    wf_repo = WorkflowRepository(db_session)
+    job_repo = JobRepository(db_session)
+
+    wf = await wf_repo.create_workflow(topic="Failed Attempt Reuse Guard")
+    job = await job_repo.create_job(
+        workflow_id=wf.id,
+        logical_key="video:shot:1",
+        job_type="video_generation",
+        stage=JobStage.VIDEO_GENERATION.value,
+        input_payload={"prompt": "prompt"},
+        max_attempts=3,
+    )
+    job_id = job.id
+    await db_session.commit()
+
+    created_operations: list[str] = []
+    polled_operations: list[str] = []
+
+    class MockFailingThenSucceedingHandler:
+        async def execute(self, j: JobModel, a: JobAttemptModel, w: JobWorker) -> dict[str, Any]:
+            recoverable_op = await w.get_recoverable_provider_operation_id(j.id)
+            if a.attempt_number == 1:
+                # First attempt: submits op-old, then fails with retryable error
+                assert recoverable_op is None
+                await w.record_submission_pending("veo", j.input_payload)
+                op_old = "operations/veo-old-fail-123"
+                await w.record_submitted(op_old)
+                created_operations.append(op_old)
+
+                class ProviderTransientError(Exception):
+                    retryable = True
+                    code = "PROVIDER_503"
+
+                raise ProviderTransientError("Temporary provider 503")
+            else:
+                # Second attempt: must NOT discover op-old!
+                assert recoverable_op is None
+                await w.record_submission_pending("veo", j.input_payload)
+                op_new = "operations/veo-new-success-456"
+                await w.record_submitted(op_new)
+                created_operations.append(op_new)
+                polled_operations.append(op_new)
+                return {
+                    "operation_id": op_new,
+                    "video_path": "tmp/staging/shot_1.mp4",
+                    "status": "completed",
+                }
+
+    # Run Worker 1 for Attempt 1
+    worker_1 = JobWorker(session_factory=session_factory, worker_id="worker-1")
+    worker_1.register_handler("video_generation", MockFailingThenSucceedingHandler())
+
+    processed_1 = await worker_1.run_once()
+    assert processed_1 is True
+
+    # Clear retry backoff for immediate test assertion
+    async with session_factory() as session:
+        j_repo = JobRepository(session)
+        j = await j_repo.get_job(job_id)
+        assert j is not None
+        assert j.status == JobStatus.PENDING.value
+        j.available_at = utc_now()
+        await session.commit()
+
+    # Run Worker 2 for Attempt 2
+    worker_2 = JobWorker(session_factory=session_factory, worker_id="worker-2")
+    worker_2.register_handler("video_generation", MockFailingThenSucceedingHandler())
+
+    processed_2 = await worker_2.run_once()
+    assert processed_2 is True
+
+    # Assertions:
+    # 1. op-old was never polled after attempt 1 failed!
+    assert "operations/veo-old-fail-123" not in polled_operations
+    # 2. Both operations were created (1 old, 1 new fresh submission)
+    assert created_operations == [
+        "operations/veo-old-fail-123",
+        "operations/veo-new-success-456",
+    ]
+    assert polled_operations == ["operations/veo-new-success-456"]
+
+    # 3. Final database state: Attempt 1 is FAILED, Attempt 2 is COMPLETED
+    async with session_factory() as session:
+        j_repo = JobRepository(session)
+        final_j = await j_repo.get_job(job_id, load_attempts=True)
+        assert final_j is not None
+        assert final_j.status == JobStatus.COMPLETED.value
+        assert len(final_j.attempts) == 2
+        assert final_j.attempts[0].status == AttemptStatus.FAILED.value
+        assert final_j.attempts[0].provider_operation_id == "operations/veo-old-fail-123"
+        assert final_j.attempts[1].status == AttemptStatus.COMPLETED.value
+        assert final_j.attempts[1].provider_operation_id == "operations/veo-new-success-456"

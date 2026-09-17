@@ -61,6 +61,7 @@ class JobWorker:
         self._shutdown_requested = False
         self._active_job_id: str | None = None
         self._active_lease_token: str | None = None
+        self._active_attempt_number: int | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._main_task: asyncio.Task[None] | None = None
 
@@ -105,6 +106,17 @@ class JobWorker:
                 response_metadata=response_metadata,
             )
             await session.commit()
+
+    async def get_recoverable_provider_operation_id(
+        self,
+        job_id: str,
+        attempt_number: int | None = None,
+    ) -> str | None:
+        """Query recoverable provider_operation_id from candidate attempt N-1."""
+        target_attempt = attempt_number or self._active_attempt_number or 1
+        async with self._session_factory() as session:
+            repo = JobRepository(session)
+            return await repo.get_recoverable_provider_operation_id(job_id, target_attempt)
 
     async def get_latest_provider_operation_id(self, job_id: str) -> str | None:
         """Query most recent non-null provider_operation_id for a job across prior attempts."""
@@ -164,6 +176,7 @@ class JobWorker:
         job, attempt = claim
         self._active_job_id = job.id
         self._active_lease_token = attempt.lease_token
+        self._active_attempt_number = attempt.attempt_number
 
         # 2. Start lease heartbeat loop
         self._heartbeat_task = asyncio.create_task(
@@ -245,6 +258,7 @@ class JobWorker:
             self._heartbeat_task = None
         self._active_job_id = None
         self._active_lease_token = None
+        self._active_attempt_number = None
 
     async def start(self, poll_interval_seconds: float = 1.0) -> None:
         """Start long-running worker processing loop."""

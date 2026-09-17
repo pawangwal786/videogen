@@ -328,6 +328,38 @@ class JobRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_recoverable_provider_operation_id(
+        self,
+        job_id: str,
+        attempt_number: int,
+    ) -> str | None:
+        """Find a recoverable provider_operation_id from candidate attempt N-1.
+
+        Contract:
+        - Inspects strictly candidate attempt_number - 1.
+        - If candidate attempt has status == EXPIRED and provider_operation_id IS NOT NULL,
+          returns provider_operation_id.
+        - In all other cases (candidate was FAILED, does not exist, or has no op ID), returns None.
+        """
+        if attempt_number <= 1:
+            return None
+
+        target_attempt_number = attempt_number - 1
+        stmt = select(JobAttemptModel).where(
+            JobAttemptModel.job_id == job_id,
+            JobAttemptModel.attempt_number == target_attempt_number,
+        )
+        result = await self._session.execute(stmt)
+        candidate = result.scalar_one_or_none()
+
+        if (
+            candidate is not None
+            and candidate.status == AttemptStatus.EXPIRED.value
+            and candidate.provider_operation_id is not None
+        ):
+            return candidate.provider_operation_id
+        return None
+
     async def get_latest_provider_operation_id(self, job_id: str) -> str | None:
         """Find the most recent non-null provider_operation_id across attempts for this job."""
         stmt = (
@@ -342,7 +374,11 @@ class JobRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
-    async def find_expired_leases(self, lease_timeout_seconds: float) -> list[JobAttemptModel]:
+    async def find_expired_leases(
+        self,
+        lease_timeout_seconds: float,
+        for_update: bool = False,
+    ) -> list[JobAttemptModel]:
         """Locate all active job attempts whose heartbeat has exceeded lease_timeout_seconds."""
         cutoff = utc_now() - timedelta(seconds=lease_timeout_seconds)
         stmt = (
@@ -359,5 +395,82 @@ class JobRepository:
             )
             .order_by(JobAttemptModel.heartbeat_at.asc())
         )
+        if for_update:
+            stmt = stmt.with_for_update(skip_locked=True)
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def claim_expired_attempt_for_recovery(
+        self,
+        attempt_id: str,
+        recovery_worker_id: str,
+        recovery_lease_token: str,
+        cutoff: datetime,
+    ) -> JobAttemptModel | None:
+        """Atomically claim an expired attempt for recovery, establishing durable ownership fencing.
+
+        Transitions worker_id and lease_token to the recovery worker while updating heartbeat_at.
+        Returns the attempt if claimed, or None if the attempt was already claimed, refreshed, or completed.
+        """
+        stmt = (
+            select(JobAttemptModel)
+            .where(
+                JobAttemptModel.id == attempt_id,
+                JobAttemptModel.status == AttemptStatus.SUBMISSION_PENDING.value,
+                JobAttemptModel.heartbeat_at < cutoff,
+            )
+            .with_for_update()
+        )
+        result = await self._session.execute(stmt)
+        attempt = result.scalar_one_or_none()
+        if attempt is None:
+            return None
+
+        attempt.worker_id = recovery_worker_id
+        attempt.lease_token = recovery_lease_token
+        attempt.heartbeat_at = utc_now()
+        await self._session.flush()
+        return attempt
+
+    async def apply_recovery_outcome(
+        self,
+        attempt_id: str,
+        recovery_worker_id: str,
+        recovery_lease_token: str,
+        new_attempt_status: str,
+        completed_at: datetime,
+        provider_operation_id: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> JobAttemptModel | None:
+        """Conditionally apply reconciliation outcome in Phase C using recovery ownership fencing.
+
+        Verifies that worker_id and lease_token still match the recovery worker.
+        If ownership was lost or attempt was modified, returns None (advisory outcome discarded).
+        """
+        stmt = (
+            select(JobAttemptModel)
+            .where(
+                JobAttemptModel.id == attempt_id,
+                JobAttemptModel.worker_id == recovery_worker_id,
+                JobAttemptModel.lease_token == recovery_lease_token,
+                JobAttemptModel.status == AttemptStatus.SUBMISSION_PENDING.value,
+            )
+            .with_for_update()
+        )
+        result = await self._session.execute(stmt)
+        attempt = result.scalar_one_or_none()
+        if attempt is None:
+            return None
+
+        attempt.status = new_attempt_status
+        attempt.completed_at = completed_at
+        if provider_operation_id is not None:
+            attempt.provider_operation_id = provider_operation_id
+        if error_code is not None:
+            attempt.error_code = error_code
+        if error_message is not None:
+            attempt.error_message = error_message
+
+        await self._session.flush()
+        return attempt

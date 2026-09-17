@@ -105,9 +105,16 @@ class WorkflowOrchestrator:
             wf_repo = WorkflowRepository(session)
             job_repo = JobRepository(session)
 
-            wf_model = await wf_repo.get_workflow(workflow_id)
+            wf_model = await wf_repo.get_workflow_for_update(workflow_id)
             if wf_model is None:
                 raise WorkflowNotFoundError(workflow_id)
+
+            if wf_model.status in {
+                WorkflowStatus.COMPLETED.value,
+                WorkflowStatus.FAILED.value,
+                WorkflowStatus.CANCELLED.value,
+            }:
+                return Workflow.model_validate(wf_model)
 
             await wf_repo.update_status(workflow_id, status=WorkflowStatus.CANCELLED.value)
 
