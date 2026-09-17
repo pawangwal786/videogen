@@ -151,6 +151,18 @@ class WorkflowOrchestrator:
             jobs = await job_repo.list_jobs_for_workflow(workflow_id)
             jobs_by_key = {j.logical_key: j for j in jobs}
 
+            failed_job = next((j for j in jobs if j.status == JobStatus.FAILED.value), None)
+            if failed_job is not None:
+                await wf_repo.update_status(
+                    workflow_id,
+                    status=WorkflowStatus.FAILED.value,
+                    error_code=failed_job.error_code,
+                    error_message=failed_job.error_message,
+                )
+                await session.commit()
+                updated_wf = await wf_repo.get_workflow(workflow_id)
+                return Workflow.model_validate(updated_wf)
+
             current_stage = JobStage(wf.current_stage)
 
             if current_stage == JobStage.RESEARCH:

@@ -112,17 +112,20 @@ class JobWorker:
         job_id: str,
         attempt_number: int | None = None,
     ) -> str | None:
-        """Query recoverable provider_operation_id from candidate attempt N-1."""
-        target_attempt = attempt_number or self._active_attempt_number or 1
+        """Query recoverable provider_operation_id from candidate attempt N-1.
+
+        Requires an explicit attempt_number or an active worker attempt.
+        """
+        target_attempt = (
+            attempt_number if attempt_number is not None else self._active_attempt_number
+        )
+        if target_attempt is None:
+            raise RuntimeError(
+                "Cannot query recoverable operation ID without an active attempt or explicit attempt_number"
+            )
         async with self._session_factory() as session:
             repo = JobRepository(session)
             return await repo.get_recoverable_provider_operation_id(job_id, target_attempt)
-
-    async def get_latest_provider_operation_id(self, job_id: str) -> str | None:
-        """Query most recent non-null provider_operation_id for a job across prior attempts."""
-        async with self._session_factory() as session:
-            repo = JobRepository(session)
-            return await repo.get_latest_provider_operation_id(job_id)
 
     async def _heartbeat_loop(self, job_id: str, lease_token: str) -> None:
         """Background task periodically updating the worker's lease heartbeat."""
@@ -219,7 +222,8 @@ class JobWorker:
             await self._orchestrator.advance_workflow(job.workflow_id)
 
         except asyncio.CancelledError:
-            # Worker shutdown requested: in-flight provider state is already durable in PostgreSQL
+            # Worker shutdown requested: abort-and-recover model. Guarantees no new work
+            # is claimed and any already-persisted provider state remains recoverable in PostgreSQL.
             logger.info("job_execution_interrupted_shutdown", job_id=job.id)
             self._cleanup_active_job()
             raise
@@ -282,7 +286,11 @@ class JobWorker:
         self._main_task = asyncio.create_task(_loop())
 
     async def stop(self) -> None:
-        """Initiate graceful worker shutdown."""
+        """Initiate worker shutdown under the abort-and-recover model.
+
+        Guarantees that no new work is claimed and that any already-persisted
+        provider state remains recoverable in PostgreSQL.
+        """
         self._shutdown_requested = True
         self._running = False
         if self._main_task is not None:

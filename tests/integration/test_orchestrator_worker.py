@@ -357,12 +357,11 @@ async def test_worker_restart_resumes_persisted_provider_operation(
     # Verify that operation ID survived Worker A's crash in PostgreSQL
     async with session_factory() as session:
         job_repo = JobRepository(session)
-        persisted_op_id = await job_repo.get_latest_provider_operation_id(job_id)
-        assert persisted_op_id == "operations/veo-real-4567"
-
-        # Backdate heartbeat of Worker A's attempt to simulate lease expiration
         job_with_att = await job_repo.get_job(job_id, load_attempts=True)
         assert job_with_att is not None and len(job_with_att.attempts) > 0
+        assert job_with_att.attempts[0].provider_operation_id == "operations/veo-real-4567"
+
+        # Backdate heartbeat of Worker A's attempt to simulate lease expiration
         attempt_a = job_with_att.attempts[0]
         attempt_a.heartbeat_at = utc_now() - timedelta(seconds=120)
         await session.commit()

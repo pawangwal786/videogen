@@ -297,14 +297,13 @@ async def test_resolved_recovery_executes_to_completion(
     pg_engine: AsyncEngine,
     db_session: AsyncSession,
 ):
-    """Architectural Directive Verification:
-    Full recovery lifecycle proof:
+    """Orchestration recovery contract verification using a deterministic handler:
     Worker A crashes in SUBMISSION_PENDING
     -> Recovery worker reconciles RESOLVED
     -> Job becomes PENDING with available_at <= now
     -> Worker B claims job
-    -> Worker B resumes persisted provider operation (zero duplicate submissions)
-    -> Provider operation completes
+    -> Worker B inherits recoverable operation ID from attempt N-1 (zero duplicate submissions)
+    -> Handler completes existing operation
     -> Job marked COMPLETED
     -> Workflow advances
     """
@@ -539,3 +538,233 @@ async def test_heartbeat_and_recovery_race_protection(
                 worker_id="active-worker",
                 lease_token=original_lease_token,
             )
+
+
+@pytest.mark.asyncio
+async def test_slow_reconciliation_does_not_allow_second_recovery_claim(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Verify that a slow Phase B external reconciliation does not allow a second recovery worker
+    to steal the claim while reconciliation is in flight.
+
+    Flow:
+    1. Worker A enters SUBMISSION_PENDING and crashes (heartbeat expires).
+    2. Recovery Worker 1 claims the attempt (heartbeat = now, lease_token updated).
+    3. Recovery Worker 1 enters Phase B with a slow reconciler paused at an event.
+    4. Time elapsed exceeds lease_timeout_seconds.
+    5. Recovery Worker 1's background heartbeat keeps the claim alive in PostgreSQL.
+    6. Recovery Worker 2 runs scan; asserts it CANNOT claim the attempt (0 expired detected).
+    7. Release Recovery Worker 1's reconciler; Recovery Worker 1 finishes Phase C successfully.
+    """
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    wf_repo = WorkflowRepository(db_session)
+    job_repo = JobRepository(db_session)
+
+    wf = await wf_repo.create_workflow(topic="Slow Reconciliation Heartbeat")
+    job = await job_repo.create_job(
+        workflow_id=wf.id,
+        logical_key="video:shot:1",
+        job_type="video_generation",
+        stage=JobStage.VIDEO_GENERATION.value,
+        input_payload={"prompt": "prompt"},
+        max_attempts=3,
+    )
+    job_id = job.id
+    await db_session.commit()
+
+    claim = await job_repo.claim_next_job(worker_id="initial-worker")
+    assert claim is not None
+    _, attempt = claim
+
+    await job_repo.record_submission_pending(
+        job_id=job_id,
+        worker_id="initial-worker",
+        lease_token=attempt.lease_token,
+        provider="slow_provider",
+    )
+    # Simulate initial crash: expired heartbeat
+    attempt.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
+    await db_session.commit()
+
+    # Synchronizers for slow reconciliation
+    reconciliation_started = asyncio.Event()
+    reconciliation_release = asyncio.Event()
+
+    class PausableReconciler:
+        async def reconcile_submission(
+            self,
+            submission_token: str | None,
+            provider_operation_id: str | None,
+        ) -> ReconciliationOutcome:
+            reconciliation_started.set()
+            await reconciliation_release.wait()
+            return ReconciliationOutcome(
+                status=ReconciliationStatus.RESOLVED,
+                provider_operation_id="operations/slow-reconciled-123",
+            )
+
+    lease_timeout = 0.4  # 400ms timeout
+    heartbeat_interval = 0.1  # 100ms heartbeat interval
+
+    recovery_1 = RecoveryWorker(
+        session_factory=session_factory,
+        lease_timeout_seconds=lease_timeout,
+        heartbeat_interval_seconds=heartbeat_interval,
+        worker_id="recovery-1",
+    )
+    recovery_1.register_reconciler("slow_provider", PausableReconciler())
+
+    recovery_2 = RecoveryWorker(
+        session_factory=session_factory,
+        lease_timeout_seconds=lease_timeout,
+        heartbeat_interval_seconds=heartbeat_interval,
+        worker_id="recovery-2",
+    )
+    recovery_2.register_reconciler("slow_provider", MockVeoReconciler(mode="found"))
+
+    # Start Recovery 1 in background
+    task_1 = asyncio.create_task(recovery_1.run_once())
+
+    # Wait until Recovery 1 claims and enters Phase B provider call
+    await asyncio.wait_for(reconciliation_started.wait(), timeout=5.0)
+
+    # Wait longer than the lease_timeout (0.6s > 0.4s)
+    await asyncio.sleep(0.6)
+
+    # Recovery 2 runs scan: must NOT be able to claim attempt because Recovery 1 is heartbeating!
+    report_2 = await recovery_2.run_once()
+    assert report_2.expired_attempts_detected == 0, (
+        "Recovery 2 erroneously detected an expired attempt while Recovery 1 was actively heartbeating"
+    )
+    assert report_2.jobs_rescheduled == 0
+
+    # Release Recovery 1
+    reconciliation_release.set()
+    report_1 = await asyncio.wait_for(task_1, timeout=5.0)
+
+    assert report_1.expired_attempts_detected == 1
+    assert report_1.jobs_rescheduled == 1
+
+    db_session.expire_all()
+    final_job = await job_repo.get_job(job_id, load_attempts=True)
+    assert final_job is not None
+    assert final_job.status == JobStatus.PENDING.value
+    assert final_job.attempts[0].status == AttemptStatus.EXPIRED.value
+    assert final_job.attempts[0].provider_operation_id == "operations/slow-reconciled-123"
+
+
+@pytest.mark.asyncio
+async def test_recovery_max_attempts_marks_workflow_failed(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
+    """Verify that when a job terminally fails in RecoveryWorker due to exceeding max_attempts,
+    the failure propagates to the workflow state machine and marks the workflow FAILED.
+
+    Tests both:
+    1. Ordinary lease expiration exceeding max_attempts (Phase A).
+    2. CONFIRMED_ABSENT reconciliation exceeding max_attempts (Phase C).
+    """
+    session_factory = async_sessionmaker(
+        bind=pg_engine, class_=AsyncSession, expire_on_commit=False
+    )
+    wf_repo = WorkflowRepository(db_session)
+    job_repo = JobRepository(db_session)
+
+    # -------------------------------------------------------------
+    # Case 1: Ordinary lease expiration exceeds max_attempts (Phase A)
+    # -------------------------------------------------------------
+    wf_1 = await wf_repo.create_workflow(topic="Max Attempts Ordinary Lease")
+    wf_1_id = wf_1.id
+    job_1 = await job_repo.create_job(
+        workflow_id=wf_1_id,
+        logical_key="research",
+        job_type="research",
+        stage=JobStage.RESEARCH.value,
+        input_payload={"topic": "Research Max Attempts"},
+        max_attempts=1,  # Only 1 attempt allowed
+    )
+    job_1_id = job_1.id
+    await db_session.commit()
+
+    claim_1 = await job_repo.claim_next_job(worker_id="crash-worker-1")
+    assert claim_1 is not None
+    _, attempt_1 = claim_1
+    assert attempt_1.attempt_number == 1
+
+    # Backdate heartbeat to trigger lease expiry
+    attempt_1.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
+    await db_session.commit()
+
+    recovery_worker = RecoveryWorker(session_factory=session_factory, lease_timeout_seconds=30.0)
+    report_1 = await recovery_worker.run_once()
+
+    assert report_1.expired_attempts_detected == 1
+    assert report_1.jobs_rescheduled == 0
+    assert report_1.jobs_terminally_failed == 1
+
+    db_session.expire_all()
+    failed_job_1 = await job_repo.get_job(job_1_id)
+    assert failed_job_1 is not None
+    assert failed_job_1.status == JobStatus.FAILED.value
+    assert failed_job_1.error_code == "LEASE_EXPIRED"
+
+    failed_wf_1 = await wf_repo.get_workflow(wf_1_id)
+    assert failed_wf_1 is not None
+    assert failed_wf_1.status == WorkflowStatus.FAILED.value
+    assert failed_wf_1.error_code == "LEASE_EXPIRED"
+
+    # -------------------------------------------------------------
+    # Case 2: CONFIRMED_ABSENT exceeds max_attempts (Phase C)
+    # -------------------------------------------------------------
+    wf_2 = await wf_repo.create_workflow(topic="Max Attempts Confirmed Absent")
+    wf_2_id = wf_2.id
+    job_2 = await job_repo.create_job(
+        workflow_id=wf_2_id,
+        logical_key="script",
+        job_type="script",
+        stage=JobStage.SCRIPT.value,
+        input_payload={"topic": "Script Max Attempts"},
+        max_attempts=1,  # Only 1 attempt allowed
+    )
+    job_2_id = job_2.id
+    await db_session.commit()
+
+    claim_2 = await job_repo.claim_next_job(worker_id="crash-worker-2")
+    assert claim_2 is not None
+    _, attempt_2 = claim_2
+
+    await job_repo.record_submission_pending(
+        job_id=job_2_id,
+        worker_id="crash-worker-2",
+        lease_token=attempt_2.lease_token,
+        provider="mock_absent_provider",
+    )
+    attempt_2.heartbeat_at = datetime.now(UTC) - timedelta(seconds=120)
+    await db_session.commit()
+
+    recovery_worker_absent = RecoveryWorker(
+        session_factory=session_factory, lease_timeout_seconds=30.0
+    )
+    recovery_worker_absent.register_reconciler(
+        "mock_absent_provider", MockVeoReconciler(mode="confirmed_absent")
+    )
+
+    report_2 = await recovery_worker_absent.run_once()
+    assert report_2.expired_attempts_detected == 1
+    assert report_2.jobs_rescheduled == 0
+    assert report_2.jobs_terminally_failed == 1
+
+    db_session.expire_all()
+    failed_job_2 = await job_repo.get_job(job_2_id)
+    assert failed_job_2 is not None
+    assert failed_job_2.status == JobStatus.FAILED.value
+    assert failed_job_2.error_code == "MAX_ATTEMPTS_EXCEEDED"
+
+    failed_wf_2 = await wf_repo.get_workflow(wf_2_id)
+    assert failed_wf_2 is not None
+    assert failed_wf_2.status == WorkflowStatus.FAILED.value
+    assert failed_wf_2.error_code == "MAX_ATTEMPTS_EXCEEDED"

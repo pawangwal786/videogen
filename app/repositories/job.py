@@ -360,20 +360,6 @@ class JobRepository:
             return candidate.provider_operation_id
         return None
 
-    async def get_latest_provider_operation_id(self, job_id: str) -> str | None:
-        """Find the most recent non-null provider_operation_id across attempts for this job."""
-        stmt = (
-            select(JobAttemptModel.provider_operation_id)
-            .where(
-                JobAttemptModel.job_id == job_id,
-                JobAttemptModel.provider_operation_id.is_not(None),
-            )
-            .order_by(JobAttemptModel.attempt_number.desc())
-            .limit(1)
-        )
-        result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
-
     async def find_expired_leases(
         self,
         lease_timeout_seconds: float,
@@ -431,6 +417,31 @@ class JobRepository:
         attempt.heartbeat_at = utc_now()
         await self._session.flush()
         return attempt
+
+    async def heartbeat_recovery_claim(
+        self,
+        attempt_id: str,
+        recovery_worker_id: str,
+        recovery_lease_token: str,
+    ) -> bool:
+        """Update heartbeat timestamp for an in-flight recovery claim.
+
+        Fenced by attempt_id, recovery_worker_id, recovery_lease_token, and status == SUBMISSION_PENDING.
+        Returns True if heartbeat was updated, False if ownership was lost or status changed.
+        """
+        stmt = select(JobAttemptModel).where(
+            JobAttemptModel.id == attempt_id,
+            JobAttemptModel.worker_id == recovery_worker_id,
+            JobAttemptModel.lease_token == recovery_lease_token,
+            JobAttemptModel.status == AttemptStatus.SUBMISSION_PENDING.value,
+        )
+        result = await self._session.execute(stmt)
+        attempt = result.scalar_one_or_none()
+        if attempt is None:
+            return False
+        attempt.heartbeat_at = utc_now()
+        await self._session.flush()
+        return True
 
     async def apply_recovery_outcome(
         self,
