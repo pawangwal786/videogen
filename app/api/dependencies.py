@@ -1,6 +1,8 @@
 """Dependency injection providers for FastAPI endpoints."""
 
 import asyncio
+import hashlib
+import math
 import secrets
 import time
 
@@ -103,7 +105,7 @@ class InMemoryRateLimiter:
         self._lock = asyncio.Lock()
 
     async def check(self, client_identifier: str) -> None:
-        """Check and record request timestamp, raising HTTP 429 if rate limit is exceeded."""
+        """Check and record request timestamp, raising HTTP 429 with dynamic Retry-After if exceeded."""
         now = time.monotonic()
         window_start = now - 60.0
         async with self._lock:
@@ -111,19 +113,41 @@ class InMemoryRateLimiter:
             # Evict timestamps outside current 60s sliding window
             self._requests[client_identifier] = [t for t in history if t > window_start]
             if len(self._requests[client_identifier]) >= self.requests_per_minute:
+                oldest_ts = self._requests[client_identifier][0]
+                remaining_seconds = max(1, math.ceil((oldest_ts + 60.0) - now))
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                     detail=(
                         f"Rate limit of {self.requests_per_minute} requests per minute exceeded. "
                         "Please try again later."
                     ),
+                    headers={"Retry-After": str(remaining_seconds)},
                 )
             self._requests[client_identifier].append(now)
 
 
 async def check_workflow_creation_rate_limit(request: Request) -> None:
-    """Endpoint dependency enforcing rate limiting on workflow creation."""
+    """Endpoint dependency enforcing rate limiting on workflow creation.
+
+    Identifies caller preferentially by authenticated token hash before falling back to client IP.
+    Plaintext tokens are never stored or logged.
+    """
     limiter: InMemoryRateLimiter | None = getattr(request.app.state, "rate_limiter", None)
     if limiter is not None:
-        client_ip = request.client.host if request.client else "unknown"
-        await limiter.check(client_ip)
+        # Extract caller identifier
+        auth_header = request.headers.get("Authorization")
+        api_key_header = request.headers.get("X-API-Key")
+        token: str | None = None
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+        elif api_key_header:
+            token = api_key_header.strip()
+
+        if token:
+            token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+            client_id = f"token:{token_hash}"
+        else:
+            client_ip = request.client.host if request.client else "unknown"
+            client_id = f"ip:{client_ip}"
+
+        await limiter.check(client_id)

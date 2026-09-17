@@ -42,13 +42,10 @@ async def create_workflow(
     idempotency_key: Annotated[str | None, Depends(get_idempotency_key)] = None,
     orchestrator: Annotated[WorkflowOrchestrator, Depends(get_orchestrator)] = None,  # type: ignore[assignment]
 ) -> Response:
-    is_replay = False
     if idempotency_key is not None:
         existing = await orchestrator.get_workflow_by_idempotency_key(idempotency_key)
-        if existing is not None:
-            if existing.topic != payload.topic:
-                raise IdempotencyConflictError(idempotency_key, existing.topic, payload.topic)
-            is_replay = True
+        if existing is not None and existing.topic != payload.topic:
+            raise IdempotencyConflictError(idempotency_key, existing.topic, payload.topic)
 
     workflow = await orchestrator.create_workflow(
         topic=payload.topic,
@@ -56,7 +53,7 @@ async def create_workflow(
     )
 
     response_data = WorkflowResponse.model_validate(workflow).model_dump(mode="json")
-    status_code = status.HTTP_200_OK if is_replay else status.HTTP_201_CREATED
+    status_code = status.HTTP_201_CREATED if workflow.was_created else status.HTTP_200_OK
     return JSONResponse(status_code=status_code, content=response_data)
 
 

@@ -44,6 +44,7 @@ class WorkflowRepository:
             existing = await self.get_by_idempotency_key(idempotency_key)
             if existing is not None:
                 if existing.topic == topic:
+                    existing.was_created = False
                     return existing
                 raise IdempotencyConflictError(idempotency_key, existing.topic, topic)
 
@@ -62,9 +63,11 @@ class WorkflowRepository:
                 existing = await self.get_by_idempotency_key(idempotency_key)
                 if existing is not None:
                     if existing.topic == topic:
+                        existing.was_created = False
                         return existing
                     raise IdempotencyConflictError(idempotency_key, existing.topic, topic) from exc
             raise
+        workflow.was_created = True
         return workflow
 
     async def get_workflow(

@@ -172,3 +172,55 @@ def test_database_settings_validation_errors():
 
     with pytest.raises(ValidationError, match="database_pool_recycle"):
         Settings(_env_file=None, database_pool_recycle=30)
+
+
+def test_production_auth_validation_fail_closed():
+    """Verify that VIDEOGEN_ENV=production fails closed when API auth token is missing or whitespace."""
+    from pydantic import ValidationError
+
+    # Production with missing token
+    with pytest.raises(
+        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
+    ):
+        Settings(_env_file=None, videogen_env="production", api_auth_token=None)
+
+    # Production with whitespace token
+    with pytest.raises(
+        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
+    ):
+        Settings(_env_file=None, videogen_env="production", api_auth_token=SecretStr("   "))
+
+    # Production with valid token succeeds
+    prod_settings = Settings(
+        _env_file=None,
+        videogen_env="production",
+        api_auth_token=SecretStr("prod-secret-token-12345"),
+    )
+    assert prod_settings.api_auth_token is not None
+    assert prod_settings.api_auth_token.get_secret_value() == "prod-secret-token-12345"
+
+    # Development and test environments remain permissive when token is omitted
+    dev_settings = Settings(_env_file=None, videogen_env="development", api_auth_token=None)
+    assert dev_settings.api_auth_token is None
+
+    test_settings = Settings(_env_file=None, videogen_env="test", api_auth_token=None)
+    assert test_settings.api_auth_token is None
+
+
+def test_production_auth_via_environment_variables(monkeypatch: pytest.MonkeyPatch):
+    """Verify production fail-closed behavior when loaded via OS environment variables."""
+    from pydantic import ValidationError
+
+    monkeypatch.setenv("VIDEOGEN_ENV", "production")
+    monkeypatch.delenv("VIDEOGEN_API_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("API_AUTH_TOKEN", raising=False)
+
+    with pytest.raises(
+        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
+    ):
+        Settings(_env_file=None)
+
+    monkeypatch.setenv("VIDEOGEN_API_AUTH_TOKEN", "valid-env-secret")
+    s = Settings(_env_file=None)
+    assert s.api_auth_token is not None
+    assert s.api_auth_token.get_secret_value() == "valid-env-secret"

@@ -49,6 +49,7 @@ class Workflow(BaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    was_created: bool = True
 
 
 class JobAttempt(BaseModel):

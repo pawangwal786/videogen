@@ -1,6 +1,7 @@
 from functools import lru_cache
+from typing import Self
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.models.errors import ModelConfigurationError
@@ -109,6 +110,17 @@ class Settings(BaseSettings):
     api_version: str = "0.1.0"
     api_rate_limit_per_minute: int = Field(default=60, ge=1)
     api_max_request_body_bytes: int = Field(default=1_048_576, ge=1024)
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> Self:
+        if self.videogen_env.lower() == "production" and (
+            self.api_auth_token is None or not self.api_auth_token.get_secret_value().strip()
+        ):
+            raise ValueError(
+                "VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production. "
+                "Production cannot run with authentication disabled."
+            )
+        return self
 
     # Integration testing safety
     videogen_run_external_tests: bool = False

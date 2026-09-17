@@ -23,6 +23,7 @@ class ErrorBody(BaseModel):
     code: str
     message: str
     details: list[ErrorDetail] | dict[str, Any] | None = None
+    correlation_id: str | None = None
 
 
 class ErrorResponse(BaseModel):

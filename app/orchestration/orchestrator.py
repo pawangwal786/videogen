@@ -88,16 +88,19 @@ class WorkflowOrchestrator:
 
             wf_model = await wf_repo.create_workflow(topic=topic, idempotency_key=idempotency_key)
 
-            # Ensure initial RESEARCH job exists
-            await job_repo.create_job(
-                workflow_id=wf_model.id,
-                logical_key="research",
-                job_type="research",
-                stage=JobStage.RESEARCH.value,
-                input_payload={"topic": topic},
-            )
+            was_created = getattr(wf_model, "was_created", True)
+            if was_created:
+                await job_repo.create_job(
+                    workflow_id=wf_model.id,
+                    logical_key="research",
+                    job_type="research",
+                    stage=JobStage.RESEARCH.value,
+                    input_payload={"topic": topic},
+                )
             await session.commit()
-            return Workflow.model_validate(wf_model)
+            wf_domain = Workflow.model_validate(wf_model)
+            wf_domain.was_created = was_created
+            return wf_domain
 
     async def get_workflow(self, workflow_id: str) -> Workflow | None:
         """Retrieve workflow by ID."""

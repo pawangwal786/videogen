@@ -1,6 +1,8 @@
 """PostgreSQL-backed integration tests for Phase 8 FastAPI Control Plane."""
 
+import asyncio
 import uuid
+from datetime import UTC
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -508,3 +510,387 @@ async def test_workflow_creation_rate_limiting(
         assert r_exceeded.status_code == 429
         err = r_exceeded.json()
         assert err["error"]["code"] == "RATE_LIMIT_EXCEEDED"
+        assert "Retry-After" in r_exceeded.headers
+        assert int(r_exceeded.headers["Retry-After"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_app_shutdown_disposes_owned_database_engine():
+    """Verify that create_app() with internally owned database engine disposes its engine upon lifespan shutdown."""
+    app = create_app()
+    assert app.state.owns_db is True
+    engine = app.state.db_engine
+    assert engine is not None
+
+    async with app.router.lifespan_context(app):
+        # Verify engine connects and queries successfully during lifespan
+        async with engine.connect() as conn:
+            res = await conn.execute(text("SELECT 1"))
+            assert res.scalar() == 1
+        # While alive, connection pool has checked in connection
+        assert engine.sync_engine.pool.checkedin() == 1
+
+    # After lifespan shutdown, the owned engine has been disposed and pool connections closed
+    assert engine.sync_engine.pool.checkedin() == 0
+
+
+@pytest.mark.asyncio
+async def test_app_shutdown_does_not_dispose_external_session_factory(
+    session_factory: async_sessionmaker[AsyncSession],
+):
+    """Verify that create_app() with externally provided session factory does not dispose the external engine."""
+    app = create_app(session_factory=session_factory)
+    assert app.state.owns_db is False
+
+    async with app.router.lifespan_context(app):
+        pass
+
+    # After lifespan shutdown, the external session_factory must remain fully functional and execute queries
+    async with session_factory() as session:
+        res = await session.execute(text("SELECT 1"))
+        assert res.scalar() == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_workflow_same_idempotency_key_same_payload(
+    session_factory: async_sessionmaker[AsyncSession],
+):
+    """20 concurrent POST /workflows with identical topic and idempotency key serialize safely.
+
+    Contract:
+    - Exactly one creator receives 201 Created.
+    - Remaining 19 requests receive 200 OK (idempotent replays).
+    - Database contains exactly 1 workflow and exactly 1 initial RESEARCH job.
+    - All response JSONs reference the identical workflow ID and topic.
+    """
+    app = create_app(session_factory=session_factory)
+    transport = ASGITransport(app=app)
+    shared_key = f"concurrent-same-{uuid.uuid4()}"
+    topic = "Concurrent Quantum Simulation"
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        tasks = [
+            client.post(
+                "/workflows",
+                json={"topic": topic},
+                headers={"Idempotency-Key": shared_key},
+            )
+            for _ in range(20)
+        ]
+        responses = await asyncio.gather(*tasks)
+
+    status_codes = [r.status_code for r in responses]
+    assert status_codes.count(201) == 1, f"Expected exactly 1 201 Created, got {status_codes}"
+    assert status_codes.count(200) == 19, f"Expected 19 200 OK replays, got {status_codes}"
+
+    first_id = responses[0].json()["id"]
+    for r in responses:
+        data = r.json()
+        assert data["id"] == first_id
+        assert data["topic"] == topic
+        assert data["current_stage"] == JobStage.RESEARCH.value
+
+    # Deep database verification
+    async with session_factory() as session:
+        # 1. Exactly one workflow row with this idempotency key
+        res_wf = await session.execute(
+            text(
+                "SELECT id, topic, idempotency_key, status, current_stage FROM workflows WHERE idempotency_key = :k"
+            ),
+            {"k": shared_key},
+        )
+        wf_rows = res_wf.fetchall()
+        assert len(wf_rows) == 1
+        assert wf_rows[0].id == first_id
+        assert wf_rows[0].topic == topic
+        assert wf_rows[0].idempotency_key == shared_key
+        assert wf_rows[0].status == WorkflowStatus.PENDING.value
+        assert wf_rows[0].current_stage == JobStage.RESEARCH.value
+
+        # 2. Exactly one initial job created for this workflow (no duplicate initial jobs)
+        res_jobs = await session.execute(
+            text("SELECT id, stage, status FROM jobs WHERE workflow_id = :wfid"),
+            {"wfid": first_id},
+        )
+        job_rows = res_jobs.fetchall()
+        assert len(job_rows) == 1
+        assert job_rows[0].stage == JobStage.RESEARCH.value
+        assert job_rows[0].status == JobStatus.PENDING.value
+
+        # 3. Overall database state invariant: no duplicate records, no orphan jobs
+        res_all_wf = await session.execute(text("SELECT count(*) FROM workflows"))
+        assert res_all_wf.scalar() == 1
+
+        res_all_jobs = await session.execute(text("SELECT count(*) FROM jobs"))
+        assert res_all_jobs.scalar() == 1
+
+        res_dup_keys = await session.execute(
+            text(
+                "SELECT idempotency_key FROM workflows GROUP BY idempotency_key HAVING count(*) > 1"
+            )
+        )
+        assert len(res_dup_keys.fetchall()) == 0
+
+        res_orphan_jobs = await session.execute(
+            text("SELECT id FROM jobs WHERE workflow_id NOT IN (SELECT id FROM workflows)")
+        )
+        assert len(res_orphan_jobs.fetchall()) == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_create_workflow_same_idempotency_key_conflicting_payload(
+    session_factory: async_sessionmaker[AsyncSession],
+):
+    """Concurrent POST /workflows with identical key but conflicting topics results in 1 winner and 409 Conflicts."""
+    app = create_app(session_factory=session_factory)
+    transport = ASGITransport(app=app)
+    shared_key = f"concurrent-conflict-{uuid.uuid4()}"
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        tasks = [
+            client.post(
+                "/workflows",
+                json={"topic": f"Conflicting Topic {i}"},
+                headers={"Idempotency-Key": shared_key},
+            )
+            for i in range(10)
+        ]
+        responses = await asyncio.gather(*tasks)
+
+    status_codes = [r.status_code for r in responses]
+    assert status_codes.count(201) == 1, f"Expected exactly 1 winner with 201, got {status_codes}"
+    assert status_codes.count(409) == 9, f"Expected 9 409 Conflicts, got {status_codes}"
+
+    for r in responses:
+        if r.status_code == 409:
+            err = r.json()["error"]
+            assert err["code"] == "IDEMPOTENCY_CONFLICT"
+            assert "correlation_id" in err
+            assert err["correlation_id"] is not None
+
+    # Verify DB has only 1 workflow
+    async with session_factory() as session:
+        res_wf = await session.execute(
+            text("SELECT COUNT(*) FROM workflows WHERE idempotency_key = :k"),
+            {"k": shared_key},
+        )
+        assert res_wf.scalar() == 1
+
+
+@pytest.mark.asyncio
+async def test_correlation_id_in_error_response_bodies(
+    session_factory: async_sessionmaker[AsyncSession],
+):
+    """Verify that all error responses (401, 404, 409, 413, 422, 429) include correlation_id in response JSON."""
+    settings = Settings(
+        api_auth_token=SecretStr("corr-secret"),
+        api_rate_limit_per_minute=1,
+        api_max_request_body_bytes=1024,
+    )
+    app = create_app(session_factory=session_factory, settings=settings)
+    transport = ASGITransport(app=app)
+    custom_corr_id = f"test-corr-{uuid.uuid4()}"
+    auth_headers = {"Authorization": "Bearer corr-secret", "X-Correlation-ID": custom_corr_id}
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # 1. 401 Unauthorized
+        r_401 = await client.get(
+            "/workflows/nonexistent", headers={"X-Correlation-ID": custom_corr_id}
+        )
+        assert r_401.status_code == 401
+        err_401 = r_401.json()["error"]
+        assert err_401["code"] == "UNAUTHORIZED"
+        assert err_401["correlation_id"] == custom_corr_id
+
+        # 2. 404 Not Found
+        r_404 = await client.get(f"/workflows/{uuid.uuid4()}", headers=auth_headers)
+        assert r_404.status_code == 404
+        err_404 = r_404.json()["error"]
+        assert err_404["code"] == "WORKFLOW_NOT_FOUND"
+        assert err_404["correlation_id"] == custom_corr_id
+
+        # 3. 422 Validation Error
+        r_422 = await client.post("/workflows", json={"topic": ""}, headers=auth_headers)
+        assert r_422.status_code == 422
+        err_422 = r_422.json()["error"]
+        assert err_422["code"] == "VALIDATION_ERROR"
+        assert err_422["correlation_id"] == custom_corr_id
+
+        # 4. 413 Payload Too Large
+        r_413 = await client.post(
+            "/workflows",
+            content=b"x" * 2048,
+            headers={**auth_headers, "Content-Length": "2048"},
+        )
+        assert r_413.status_code == 413
+        err_413 = r_413.json()["error"]
+        assert err_413["code"] == "PAYLOAD_TOO_LARGE"
+        assert err_413["correlation_id"] == custom_corr_id
+
+        # 5. 429 Rate Limit Exceeded
+        # First request uses the 1-per-minute quota
+        await client.post("/workflows", json={"topic": "First Topic"}, headers=auth_headers)
+        # Second request triggers 429
+        r_429 = await client.post(
+            "/workflows", json={"topic": "Second Topic"}, headers=auth_headers
+        )
+        assert r_429.status_code == 429
+        err_429 = r_429.json()["error"]
+        assert err_429["code"] == "RATE_LIMIT_EXCEEDED"
+        assert err_429["correlation_id"] == custom_corr_id
+
+
+@pytest.mark.asyncio
+async def test_streaming_body_size_limiter(
+    session_factory: async_sessionmaker[AsyncSession],
+):
+    """Verify ASGI-level streaming request body limiter behavior."""
+    small_settings = Settings(api_max_request_body_bytes=1024)
+    app = create_app(session_factory=session_factory, settings=small_settings)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        # Negative Content-Length -> 400 Bad Request
+        r_neg = await client.post("/workflows", content=b"{}", headers={"Content-Length": "-5"})
+        assert r_neg.status_code == 400
+        assert r_neg.json()["error"]["code"] == "BAD_REQUEST"
+
+        # Malformed Content-Length -> 400 Bad Request
+        r_bad = await client.post(
+            "/workflows", content=b"{}", headers={"Content-Length": "invalid"}
+        )
+        assert r_bad.status_code == 400
+        assert r_bad.json()["error"]["code"] == "BAD_REQUEST"
+
+        # Chunked transfer exceeding limit without Content-Length
+        async def chunk_generator():
+            for _ in range(10):
+                yield b"x" * 200  # 2000 bytes total > 1024 byte limit
+
+        r_chunked = await client.post(
+            "/workflows",
+            content=chunk_generator(),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r_chunked.status_code == 413
+        assert r_chunked.json()["error"]["code"] == "PAYLOAD_TOO_LARGE"
+
+
+@pytest.mark.asyncio
+async def test_body_size_limiter_never_invokes_downstream_on_rejection():
+    """Verify ASGI body limiter invariant: once REJECTED, downstream app is never invoked and 413 is emitted once."""
+    from app.api.middleware import RequestSizeLimitMiddleware
+    from app.config.settings import Settings
+
+    downstream_invoked = False
+
+    async def dummy_app(scope, receive, send):
+        nonlocal downstream_invoked
+        downstream_invoked = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    settings = Settings(api_max_request_body_bytes=1024)
+    limiter = RequestSizeLimitMiddleware(dummy_app, settings=settings)
+
+    # Chunked stream exceeding 1024 bytes
+    chunks = [b"a" * 600, b"b" * 600]  # total 1200 bytes > 1024 bytes limit
+    chunk_index = 0
+
+    async def mock_receive():
+        nonlocal chunk_index
+        if chunk_index < len(chunks):
+            c = chunks[chunk_index]
+            chunk_index += 1
+            return {
+                "type": "http.request",
+                "body": c,
+                "more_body": chunk_index < len(chunks),
+            }
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent_messages = []
+
+    async def mock_send(message):
+        sent_messages.append(message)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/workflows",
+        "headers": [(b"content-type", b"application/json")],
+    }
+
+    await limiter(scope, mock_receive, mock_send)
+
+    # Invariant checks:
+    # 1. Downstream app was NEVER called
+    assert not downstream_invoked, "Downstream app was invoked despite body exceeding limit!"
+    # 2. HTTP 413 response was started exactly once
+    start_messages = [m for m in sent_messages if m["type"] == "http.response.start"]
+    assert len(start_messages) == 1
+    assert start_messages[0]["status"] == 413
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", f"/workflows/{uuid.uuid4()}"),
+        ("POST", f"/workflows/{uuid.uuid4()}/cancel"),
+        ("GET", f"/workflows/{uuid.uuid4()}/jobs"),
+        ("GET", f"/workflows/{uuid.uuid4()}/artifacts"),
+    ],
+)
+async def test_protected_routes_require_authentication(
+    session_factory: async_sessionmaker[AsyncSession],
+    method: str,
+    path: str,
+):
+    """Verify that every protected route family returns 401 Unauthorized when credentials are absent."""
+    auth_settings = Settings(api_auth_token=SecretStr("enforced-secret-token"))
+    app = create_app(session_factory=session_factory, settings=auth_settings)
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        resp = await client.request(method, path)
+        assert resp.status_code == 401
+        assert resp.headers.get("WWW-Authenticate") == "Bearer"
+        assert resp.json()["error"]["code"] == "UNAUTHORIZED"
+
+
+def test_artifact_response_sanitization():
+    """Verify ArtifactResponse strips internal provider metadata and sanitizes storage paths."""
+    from datetime import datetime
+
+    from app.api.schemas.artifact import ArtifactResponse
+    from app.orchestration.state_machine import ArtifactLifecycleStatus
+
+    resp = ArtifactResponse(
+        id=str(uuid.uuid4()),
+        workflow_id=str(uuid.uuid4()),
+        artifact_type="video",
+        storage_path="C:\\Users\\pawan\\AppData\\Local\\Temp\\final_output.mp4",
+        status=ArtifactLifecycleStatus.AVAILABLE,
+        created_at=datetime.now(UTC),
+        artifact_metadata={
+            "duration_seconds": 15.0,
+            "resolution": "1080p",
+            "gdrive_folder_id": "sensitive_folder_id",
+            "access_token": "secret_oauth_token",
+            "client_secret": "sensitive_client_secret",
+        },
+    )
+
+    # Storage path must be stripped of absolute drive paths
+    assert "\\" not in resp.storage_path
+    assert "Users" not in resp.storage_path
+    assert resp.storage_path == "final_output.mp4"
+
+    # Metadata must filter sensitive keys
+    assert resp.artifact_metadata is not None
+    assert "duration_seconds" in resp.artifact_metadata
+    assert "resolution" in resp.artifact_metadata
+    assert "gdrive_folder_id" not in resp.artifact_metadata
+    assert "access_token" not in resp.artifact_metadata
+    assert "client_secret" not in resp.artifact_metadata

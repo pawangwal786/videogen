@@ -1,5 +1,7 @@
 """Standardized error handlers and exception mappings for FastAPI application."""
 
+from typing import Any
+
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -28,34 +30,68 @@ def _status_code_to_error_code(status_code: int) -> str:
     return mapping.get(status_code, "HTTP_ERROR")
 
 
-async def workflow_not_found_handler(request: Request, exc: WorkflowNotFoundError) -> JSONResponse:
-    """Handle missing workflow lookups with 404."""
+def build_error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: list[ErrorDetail] | dict[str, Any] | None = None,
+    correlation_id: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """Construct a standardized JSONResponse with ErrorResponse envelope."""
+    response_headers = dict(headers or {})
+    if correlation_id and "X-Correlation-ID" not in response_headers:
+        response_headers["X-Correlation-ID"] = correlation_id
+
     error = ErrorResponse(
         error=ErrorBody(
-            code="WORKFLOW_NOT_FOUND",
-            message=str(exc),
+            code=code,
+            message=message,
+            details=details,
+            correlation_id=correlation_id,
         )
     )
-    return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=error.model_dump())
+    return JSONResponse(
+        status_code=status_code,
+        content=error.model_dump(),
+        headers=response_headers,
+    )
+
+
+def _extract_correlation_id(request: Request) -> str | None:
+    """Extract correlation ID from request state or fallback header."""
+    return getattr(request.state, "correlation_id", None) or request.headers.get("X-Correlation-ID")
+
+
+async def workflow_not_found_handler(request: Request, exc: WorkflowNotFoundError) -> JSONResponse:
+    """Handle missing workflow lookups with 404."""
+    corr_id = _extract_correlation_id(request)
+    return build_error_response(
+        status_code=status.HTTP_404_NOT_FOUND,
+        code="WORKFLOW_NOT_FOUND",
+        message=str(exc),
+        correlation_id=corr_id,
+    )
 
 
 async def idempotency_conflict_handler(
     request: Request, exc: IdempotencyConflictError
 ) -> JSONResponse:
     """Handle idempotency key collisions with 409 Conflict."""
-    error = ErrorResponse(
-        error=ErrorBody(
-            code="IDEMPOTENCY_CONFLICT",
-            message=str(exc),
-        )
+    corr_id = _extract_correlation_id(request)
+    return build_error_response(
+        status_code=status.HTTP_409_CONFLICT,
+        code="IDEMPOTENCY_CONFLICT",
+        message=str(exc),
+        correlation_id=corr_id,
     )
-    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=error.model_dump())
 
 
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     """Handle request schema validation errors with structured 422."""
+    corr_id = _extract_correlation_id(request)
     details: list[ErrorDetail] = []
     for err in exc.errors():
         loc = list(err.get("loc", []))
@@ -69,38 +105,31 @@ async def validation_exception_handler(
             )
         )
 
-    error = ErrorResponse(
-        error=ErrorBody(
-            code="VALIDATION_ERROR",
-            message="Request validation failed.",
-            details=details,
-        )
-    )
-    return JSONResponse(
+    return build_error_response(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        content=error.model_dump(),
+        code="VALIDATION_ERROR",
+        message="Request validation failed.",
+        details=details,
+        correlation_id=corr_id,
     )
 
 
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     """Handle explicit HTTP exceptions with standardized envelope."""
-    headers = exc.headers or {}
+    corr_id = _extract_correlation_id(request)
     code = _status_code_to_error_code(exc.status_code)
-    error = ErrorResponse(
-        error=ErrorBody(
-            code=code,
-            message=str(exc.detail),
-        )
-    )
-    return JSONResponse(
+    return build_error_response(
         status_code=exc.status_code,
-        content=error.model_dump(),
-        headers=headers,
+        code=code,
+        message=str(exc.detail),
+        correlation_id=corr_id,
+        headers=exc.headers,
     )
 
 
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle unexpected internal exceptions, logging securely without leaking secrets."""
+    corr_id = _extract_correlation_id(request)
     logger.error(
         "unhandled_server_error",
         error_type=type(exc).__name__,
@@ -109,15 +138,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
         method=request.method,
         exc_info=exc,
     )
-    error = ErrorResponse(
-        error=ErrorBody(
-            code="INTERNAL_SERVER_ERROR",
-            message="An unexpected internal server error occurred.",
-        )
-    )
-    return JSONResponse(
+    return build_error_response(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=error.model_dump(),
+        code="INTERNAL_SERVER_ERROR",
+        message="An unexpected internal server error occurred.",
+        correlation_id=corr_id,
     )
 
 
