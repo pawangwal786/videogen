@@ -47,20 +47,23 @@ def setup_logging(env: str = "development", log_level: str = "INFO") -> None:
 def bind_correlation(
     workflow_id: UUID | str | None = None,
     task_id: UUID | str | None = None,
+    correlation_id: UUID | str | None = None,
 ) -> None:
-    """Bind workflow and task correlation IDs into logging context."""
+    """Bind workflow, task, and request correlation IDs into logging context."""
     kwargs: dict[str, Any] = {}
     if workflow_id is not None:
         kwargs["workflow_id"] = str(workflow_id)
     if task_id is not None:
         kwargs["task_id"] = str(task_id)
+    if correlation_id is not None:
+        kwargs["correlation_id"] = str(correlation_id)
     if kwargs:
         structlog.contextvars.bind_contextvars(**kwargs)
 
 
 def clear_correlation() -> None:
     """Clear correlation IDs from logging context."""
-    structlog.contextvars.unbind_contextvars("workflow_id", "task_id")
+    structlog.contextvars.unbind_contextvars("workflow_id", "task_id", "correlation_id")
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:

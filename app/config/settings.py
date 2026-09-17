@@ -95,6 +95,21 @@ class Settings(BaseSettings):
     orchestrator_heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     orchestrator_max_retries: int = Field(default=3, ge=0)
 
+    # API & Control Plane
+    api_auth_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "VIDEOGEN_API_AUTH_TOKEN",
+            "API_AUTH_TOKEN",
+            "videogen_api_auth_token",
+            "api_auth_token",
+        ),
+    )
+    api_title: str = "VideoGen API"
+    api_version: str = "0.1.0"
+    api_rate_limit_per_minute: int = Field(default=60, ge=1)
+    api_max_request_body_bytes: int = Field(default=1_048_576, ge=1024)
+
     # Integration testing safety
     videogen_run_external_tests: bool = False
 

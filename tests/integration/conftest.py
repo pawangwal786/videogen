@@ -81,3 +81,9 @@ async def db_session(pg_engine: AsyncEngine):
     async with session_factory() as session:
         yield session
         await session.rollback()
+
+    # Clean tables after test
+    async with pg_engine.begin() as conn:
+        await conn.execute(
+            text("TRUNCATE TABLE artifacts, job_attempts, jobs, workflows RESTART IDENTITY CASCADE")
+        )

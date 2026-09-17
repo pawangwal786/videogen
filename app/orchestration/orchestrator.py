@@ -9,7 +9,7 @@ from app.db.models.job import JobAttemptModel
 from app.db.session import get_session_factory
 from app.logging import get_logger
 from app.orchestration.errors import WorkflowNotFoundError
-from app.orchestration.models import Artifact, Workflow
+from app.orchestration.models import Artifact, Job, Workflow
 from app.orchestration.state_machine import AttemptStatus, JobStage, JobStatus, WorkflowStatus
 from app.repositories.artifact import ArtifactRepository
 from app.repositories.job import JobRepository
@@ -69,6 +69,13 @@ class WorkflowOrchestrator:
             )
             return [Artifact.model_validate(m) for m in models]
 
+    async def list_jobs_for_workflow(self, workflow_id: str) -> list[Job]:
+        """List all jobs for a given workflow ordered by creation time."""
+        async with self._session_factory() as session:
+            repo = JobRepository(session)
+            models = await repo.list_jobs_for_workflow(workflow_id)
+            return [Job.model_validate(m) for m in models]
+
     async def create_workflow(
         self,
         topic: str,
@@ -97,6 +104,15 @@ class WorkflowOrchestrator:
         async with self._session_factory() as session:
             wf_repo = WorkflowRepository(session)
             wf_model = await wf_repo.get_workflow(workflow_id)
+            if wf_model is None:
+                return None
+            return Workflow.model_validate(wf_model)
+
+    async def get_workflow_by_idempotency_key(self, idempotency_key: str) -> Workflow | None:
+        """Retrieve workflow by idempotency key."""
+        async with self._session_factory() as session:
+            wf_repo = WorkflowRepository(session)
+            wf_model = await wf_repo.get_by_idempotency_key(idempotency_key)
             if wf_model is None:
                 return None
             return Workflow.model_validate(wf_model)

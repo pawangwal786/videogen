@@ -281,7 +281,10 @@ async def test_recovery_worker_handles_confirmed_absent_reschedules(
 
 
 @pytest.mark.asyncio
-async def test_recovery_worker_start_stop(pg_engine: AsyncEngine):
+async def test_recovery_worker_start_stop(
+    pg_engine: AsyncEngine,
+    db_session: AsyncSession,
+):
     session_factory = async_sessionmaker(
         bind=pg_engine, class_=AsyncSession, expire_on_commit=False
     )
