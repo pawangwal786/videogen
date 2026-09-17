@@ -174,37 +174,133 @@ def test_database_settings_validation_errors():
         Settings(_env_file=None, database_pool_recycle=30)
 
 
-def test_production_auth_validation_fail_closed():
-    """Verify that VIDEOGEN_ENV=production fails closed when API auth token is missing or whitespace."""
+def test_production_settings_validation_matrix():
+    """Verify complete production configuration matrix covering DB, log level, providers, and Drive tri-state."""
     from pydantic import ValidationError
 
-    # Production with missing token
-    with pytest.raises(
-        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
-    ):
-        Settings(_env_file=None, videogen_env="production", api_auth_token=None)
+    valid_prod_kwargs = {
+        "_env_file": None,
+        "videogen_env": "production",
+        "api_auth_token": SecretStr("prod-secret-token-12345"),
+        "database_url": "postgresql+asyncpg://app_user:strong_prod_pass@db.prod.internal:5432/videogen_prod",
+        "gemini_api_key": SecretStr("valid-gemini-key"),
+        "openrouter_api_key": SecretStr("valid-openrouter-key"),
+        "videogen_log_level": "INFO",
+    }
 
-    # Production with whitespace token
-    with pytest.raises(
-        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
-    ):
-        Settings(_env_file=None, videogen_env="production", api_auth_token=SecretStr("   "))
-
-    # Production with valid token succeeds
-    prod_settings = Settings(
-        _env_file=None,
-        videogen_env="production",
-        api_auth_token=SecretStr("prod-secret-token-12345"),
-    )
+    # 1. Base valid production configuration succeeds
+    prod_settings = Settings(**valid_prod_kwargs)
     assert prod_settings.api_auth_token is not None
-    assert prod_settings.api_auth_token.get_secret_value() == "prod-secret-token-12345"
 
-    # Development and test environments remain permissive when token is omitted
-    dev_settings = Settings(_env_file=None, videogen_env="development", api_auth_token=None)
-    assert dev_settings.api_auth_token is None
+    # 2. Missing or whitespace auth token in production fails
+    with pytest.raises(
+        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
+    ):
+        Settings(**{**valid_prod_kwargs, "api_auth_token": None})
+    with pytest.raises(
+        ValidationError, match="VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production"
+    ):
+        Settings(**{**valid_prod_kwargs, "api_auth_token": SecretStr("   ")})
 
-    test_settings = Settings(_env_file=None, videogen_env="test", api_auth_token=None)
-    assert test_settings.api_auth_token is None
+    # 3. Localhost / loopback DB URLs in production fail
+    for bad_host in ("localhost", "127.0.0.1", "[::1]"):
+        with pytest.raises(ValidationError, match="cannot connect to loopback/local host"):
+            Settings(
+                **{
+                    **valid_prod_kwargs,
+                    "database_url": f"postgresql+asyncpg://user:pass@{bad_host}:5432/db",
+                }
+            )
+
+    # 4. Default postgres:postgres credentials in production fail
+    with pytest.raises(ValidationError, match="cannot use default 'postgres:postgres' credentials"):
+        Settings(
+            **{
+                **valid_prod_kwargs,
+                "database_url": "postgresql+asyncpg://postgres:postgres@db.prod.internal:5432/db",
+            }
+        )
+
+    # 5. Verbose logging (DEBUG / TRACE) in production fails
+    for bad_log in ("DEBUG", "TRACE", "debug", "trace"):
+        with pytest.raises(ValidationError, match="VIDEOGEN_LOG_LEVEL cannot be set to"):
+            Settings(**{**valid_prod_kwargs, "videogen_log_level": bad_log})
+
+    # 6. Invalid log level fails across all environments
+    with pytest.raises(ValidationError, match="Invalid VIDEOGEN_LOG_LEVEL"):
+        Settings(_env_file=None, videogen_env="development", videogen_log_level="SUPER_VERBOSE")
+
+    # 7. Gemini primary missing key fails
+    with pytest.raises(ValidationError, match="GEMINI_API_KEY is required in production"):
+        Settings(**{**valid_prod_kwargs, "gemini_api_key": None})
+
+    # 8. OpenRouter fallback enabled but missing key fails
+    with pytest.raises(ValidationError, match="OPENROUTER_API_KEY is required in production"):
+        Settings(**{**valid_prod_kwargs, "openrouter_api_key": None})
+
+    # 9. Fallback disabled (None) requires only primary key
+    fallback_none_settings = Settings(
+        **{**valid_prod_kwargs, "videogen_fallback_text_provider": None, "openrouter_api_key": None}
+    )
+    assert fallback_none_settings.videogen_fallback_text_provider is None
+
+    # 10. OpenRouter as primary requires OpenRouter key
+    with pytest.raises(ValidationError, match="OPENROUTER_API_KEY is required in production"):
+        Settings(
+            **{
+                **valid_prod_kwargs,
+                "videogen_primary_text_provider": ModelProvider.OPENROUTER,
+                "videogen_fallback_text_provider": None,
+                "openrouter_api_key": None,
+            }
+        )
+
+    # 11. Google Drive tri-state:
+    # State A: Completely absent (valid)
+    assert prod_settings.google_drive_client_id is None
+
+    # State B: Fully configured (valid)
+    drive_full_kwargs = {
+        **valid_prod_kwargs,
+        "google_drive_client_id": SecretStr("client-id"),
+        "google_drive_client_secret": SecretStr("client-secret"),
+        "google_drive_refresh_token": SecretStr("refresh-token"),
+        "google_drive_root_folder_id": "root-folder",
+    }
+    drive_settings = Settings(**drive_full_kwargs)
+    assert drive_settings.google_drive_root_folder_id == "root-folder"
+
+    # State C: Partially configured (rejected in production)
+    with pytest.raises(ValidationError, match="Google Drive storage is partially configured"):
+        Settings(
+            **{
+                **valid_prod_kwargs,
+                "google_drive_client_id": SecretStr("client-id"),
+                "google_drive_client_secret": None,
+                "google_drive_refresh_token": None,
+                "google_drive_root_folder_id": None,
+            }
+        )
+
+    with pytest.raises(ValidationError, match="Google Drive storage is partially configured"):
+        Settings(
+            **{
+                **valid_prod_kwargs,
+                "google_drive_client_id": SecretStr("client-id"),
+                "google_drive_client_secret": SecretStr("client-secret"),
+                "google_drive_refresh_token": None,
+                "google_drive_root_folder_id": None,
+            }
+        )
+
+    # 12. Development and test environments remain completely permissive for defaults
+    dev = Settings(_env_file=None, videogen_env="development")
+    assert dev.api_auth_token is None
+    assert "localhost" in dev.database_url
+    assert dev.videogen_log_level == "INFO"
+
+    test = Settings(_env_file=None, videogen_env="test")
+    assert test.api_auth_token is None
 
 
 def test_production_auth_via_environment_variables(monkeypatch: pytest.MonkeyPatch):
@@ -212,6 +308,12 @@ def test_production_auth_via_environment_variables(monkeypatch: pytest.MonkeyPat
     from pydantic import ValidationError
 
     monkeypatch.setenv("VIDEOGEN_ENV", "production")
+    monkeypatch.setenv(
+        "VIDEOGEN_DATABASE_URL",
+        "postgresql+asyncpg://app:secret@db.prod.internal:5432/videogen",
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-test-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-test-secret")
     monkeypatch.delenv("VIDEOGEN_API_AUTH_TOKEN", raising=False)
     monkeypatch.delenv("API_AUTH_TOKEN", raising=False)
 

@@ -860,11 +860,36 @@ async def test_protected_routes_require_authentication(
 
 
 def test_artifact_response_sanitization():
-    """Verify ArtifactResponse strips internal provider metadata and sanitizes storage paths."""
+    """Verify ArtifactResponse projects via PublicArtifactMetadata whitelist schema, dropping all internal metadata."""
     from datetime import datetime
 
-    from app.api.schemas.artifact import ArtifactResponse
+    from app.api.schemas.artifact import ArtifactResponse, PublicArtifactMetadata
     from app.orchestration.state_machine import ArtifactLifecycleStatus
+
+    raw_internal_metadata = {
+        # Whitelisted public fields
+        "duration_seconds": 15.0,
+        "width": 1920,
+        "height": 1080,
+        "frame_rate": 30.0,
+        "codec": "libx264",
+        "audio_codec": "aac",
+        "sample_rate": 44100,
+        "bitrate_kbps": 2500,
+        "format": "mp4",
+        # Arbitrary internal fields, secrets, nested objects, and filesystem paths
+        "resolution": "1080p",
+        "gdrive_folder_id": "sensitive_folder_id",
+        "access_token": "secret_oauth_token",
+        "client_secret": "sensitive_client_secret",
+        "internal_server_path": "/var/run/videogen/temp.raw",
+        "provider_job_details": {
+            "internal_worker_id": "worker-xyz",
+            "oauth_token": "leak-attempt",
+            "nested_payload": {"debug": True},
+        },
+        "custom_unmodeled_scalar": 42,
+    }
 
     resp = ArtifactResponse(
         id=str(uuid.uuid4()),
@@ -873,24 +898,81 @@ def test_artifact_response_sanitization():
         storage_path="C:\\Users\\pawan\\AppData\\Local\\Temp\\final_output.mp4",
         status=ArtifactLifecycleStatus.AVAILABLE,
         created_at=datetime.now(UTC),
-        artifact_metadata={
-            "duration_seconds": 15.0,
-            "resolution": "1080p",
-            "gdrive_folder_id": "sensitive_folder_id",
-            "access_token": "secret_oauth_token",
-            "client_secret": "sensitive_client_secret",
-        },
+        artifact_metadata=raw_internal_metadata,  # type: ignore[arg-type]
     )
 
-    # Storage path must be stripped of absolute drive paths
+    # 1. Storage path must be stripped of absolute drive paths
     assert "\\" not in resp.storage_path
     assert "Users" not in resp.storage_path
     assert resp.storage_path == "final_output.mp4"
 
-    # Metadata must filter sensitive keys
+    # 2. Metadata is strictly projected onto PublicArtifactMetadata whitelist
     assert resp.artifact_metadata is not None
-    assert "duration_seconds" in resp.artifact_metadata
-    assert "resolution" in resp.artifact_metadata
-    assert "gdrive_folder_id" not in resp.artifact_metadata
-    assert "access_token" not in resp.artifact_metadata
-    assert "client_secret" not in resp.artifact_metadata
+    assert isinstance(resp.artifact_metadata, PublicArtifactMetadata)
+    assert resp.artifact_metadata.duration_seconds == 15.0
+    assert resp.artifact_metadata.width == 1920
+    assert resp.artifact_metadata.height == 1080
+    assert resp.artifact_metadata.frame_rate == 30.0
+    assert resp.artifact_metadata.codec == "libx264"
+    assert resp.artifact_metadata.audio_codec == "aac"
+    assert resp.artifact_metadata.sample_rate == 44100
+    assert resp.artifact_metadata.bitrate_kbps == 2500
+    assert resp.artifact_metadata.format == "mp4"
+
+    # 3. Model dump contains ZERO unmodeled internal/provider fields
+    dumped = resp.artifact_metadata.model_dump()
+    assert "gdrive_folder_id" not in dumped
+    assert "access_token" not in dumped
+    assert "client_secret" not in dumped
+    assert "resolution" not in dumped
+    assert "internal_server_path" not in dumped
+    assert "provider_job_details" not in dumped
+    assert "custom_unmodeled_scalar" not in dumped
+
+
+@pytest.mark.parametrize(
+    "raw_input,expected_reused",
+    [
+        ("123e4567-e89b-12d3-a456-426614174000", True),  # valid UUID
+        ("my-service.client_job:1234", True),  # valid custom ID matching [a-zA-Z0-9._:-]{1,64}
+        ("a" * 64, True),  # exact max length 64
+        ("a" * 65, False),  # > 64 chars
+        ("", False),  # empty
+        ("   ", False),  # whitespace only
+        ("id with space", False),  # space
+        ("id\twith_tab", False),  # tab
+        ("id\rwith_cr", False),  # CR
+        ("id\nwith_lf", False),  # LF
+        ("id_with_ünicode", False),  # non-ascii
+        ("<script>", False),  # < and >
+        ('"quoted"', False),  # double quotes
+        ("'single'", False),  # single quotes
+        ("path\\escape", False),  # backslash
+    ],
+)
+def test_correlation_id_normalization_matrix(raw_input: str, expected_reused: bool):
+    """Verify strict character set enforcement: malformed or unsafe correlation IDs are replaced by UUIDs."""
+    from app.api.middleware import normalize_correlation_id
+
+    result = normalize_correlation_id(raw_input)
+    assert result is not None
+    assert 1 <= len(result) <= 64
+    if expected_reused:
+        assert result == raw_input
+    else:
+        assert result != raw_input
+        uuid.UUID(result)
+
+
+def test_correlation_id_normalization_none_and_bytes():
+    """Verify normalize_correlation_id handles None and raw bytes cleanly."""
+    from app.api.middleware import normalize_correlation_id
+
+    res_none = normalize_correlation_id(None)
+    uuid.UUID(res_none)
+
+    res_bytes_ok = normalize_correlation_id(b"valid-bytes-corr-123")
+    assert res_bytes_ok == "valid-bytes-corr-123"
+
+    res_bytes_bad = normalize_correlation_id(b"<bad-bytes>")
+    uuid.UUID(res_bytes_bad)

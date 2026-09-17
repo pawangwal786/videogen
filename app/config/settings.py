@@ -3,6 +3,7 @@ from typing import Self
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine.url import make_url
 
 from app.models.errors import ModelConfigurationError
 from app.models.router import ModelProvider
@@ -113,13 +114,87 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_security(self) -> Self:
-        if self.videogen_env.lower() == "production" and (
-            self.api_auth_token is None or not self.api_auth_token.get_secret_value().strip()
-        ):
+        allowed_log_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL", "TRACE"}
+        log_level = self.videogen_log_level.strip().upper()
+        if log_level not in allowed_log_levels:
             raise ValueError(
-                "VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production. "
-                "Production cannot run with authentication disabled."
+                f"Invalid VIDEOGEN_LOG_LEVEL '{self.videogen_log_level}'. "
+                f"Must be one of {sorted(allowed_log_levels)}."
             )
+
+        if self.videogen_env.lower() == "production":
+            # 1. API auth token enforcement
+            if self.api_auth_token is None or not self.api_auth_token.get_secret_value().strip():
+                raise ValueError(
+                    "VIDEOGEN_API_AUTH_TOKEN is required when VIDEOGEN_ENV=production. "
+                    "Production cannot run with authentication disabled."
+                )
+
+            # 2. Database URL: structural parsing
+            try:
+                db_url = make_url(self.database_url)
+            except Exception as exc:
+                raise ValueError(f"Invalid production database URL: {exc}") from exc
+
+            host = (db_url.host or "").lower().strip("[]")
+            if host in {"localhost", "127.0.0.1", "::1"}:
+                raise ValueError(
+                    f"Production database URL cannot connect to loopback/local host '{db_url.host}'. "
+                    "Configure a dedicated managed database host for production."
+                )
+
+            # 3. Google Drive storage tri-state validation in production (disabled, fully enabled, or rejected partial)
+            drive_fields = [
+                self.google_drive_client_id
+                and self.google_drive_client_id.get_secret_value().strip(),
+                self.google_drive_client_secret
+                and self.google_drive_client_secret.get_secret_value().strip(),
+                self.google_drive_refresh_token
+                and self.google_drive_refresh_token.get_secret_value().strip(),
+                self.google_drive_root_folder_id and self.google_drive_root_folder_id.strip(),
+            ]
+            configured_drive_count = sum(1 for f in drive_fields if bool(f))
+            if 0 < configured_drive_count < 4:
+                raise ValueError(
+                    "Google Drive storage is partially configured. All four settings "
+                    "(GOOGLE_DRIVE_CLIENT_ID, GOOGLE_DRIVE_CLIENT_SECRET, GOOGLE_DRIVE_REFRESH_TOKEN, "
+                    "GOOGLE_DRIVE_ROOT_FOLDER_ID) must be provided together, or all omitted to disable."
+                )
+
+            user = (db_url.username or "").lower()
+            password = (db_url.password or "").lower()
+            if user == "postgres" and password == "postgres":
+                raise ValueError(
+                    "Production database URL cannot use default 'postgres:postgres' credentials."
+                )
+
+            # 3. Log level restrictions
+            if log_level in {"DEBUG", "TRACE"}:
+                raise ValueError(
+                    f"VIDEOGEN_LOG_LEVEL cannot be set to '{log_level}' in production. "
+                    "Use INFO, WARNING, ERROR, or CRITICAL."
+                )
+
+            # 4. Text provider validation for all enabled providers (primary + fallback)
+            enabled_providers = {self.videogen_primary_text_provider}
+            if self.videogen_fallback_text_provider is not None:
+                enabled_providers.add(self.videogen_fallback_text_provider)
+
+            if ModelProvider.GEMINI in enabled_providers and (
+                not self.gemini_api_key or not self.gemini_api_key.get_secret_value().strip()
+            ):
+                raise ValueError(
+                    "GEMINI_API_KEY is required in production when Gemini is configured as primary or fallback provider."
+                )
+
+            if ModelProvider.OPENROUTER in enabled_providers and (
+                not self.openrouter_api_key
+                or not self.openrouter_api_key.get_secret_value().strip()
+            ):
+                raise ValueError(
+                    "OPENROUTER_API_KEY is required in production when OpenRouter is configured as primary or fallback provider."
+                )
+
         return self
 
     # Integration testing safety

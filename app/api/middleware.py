@@ -1,5 +1,6 @@
 """API middleware for request correlation, payload size limiting, and security."""
 
+import re
 import uuid
 
 from fastapi import status
@@ -10,6 +11,25 @@ from app.config.settings import Settings, get_settings
 from app.logging import bind_correlation, clear_correlation, get_logger
 
 logger = get_logger(__name__)
+
+_CORRELATION_ID_REGEX = re.compile(r"^[a-zA-Z0-9._:-]{1,64}$")
+
+
+def normalize_correlation_id(raw: str | bytes | None) -> str:
+    """Normalize and validate an incoming correlation or request identifier.
+
+    Enforces a strict conservative character set (^[a-zA-Z0-9._:-]{1,64}$) to prevent
+    header injection or log pollution. Falls back to a freshly generated UUID4 for any
+    absent, whitespace-only, overly long, or malformed input.
+    """
+    if raw is None:
+        return str(uuid.uuid4())
+    if isinstance(raw, bytes):
+        raw = raw.decode("latin1", errors="replace")
+    cleaned = raw.strip()
+    if _CORRELATION_ID_REGEX.match(cleaned):
+        return cleaned
+    return str(uuid.uuid4())
 
 
 class CorrelationIdMiddleware:
@@ -23,16 +43,13 @@ class CorrelationIdMiddleware:
             await self.app(scope, receive, send)
             return
 
-        corr_id: str | None = None
+        raw_header_val: bytes | str | None = None
         for k, v in scope.get("headers", []):
             if k.lower() in (b"x-correlation-id", b"x-request-id"):
-                val = v.decode("latin1", errors="replace").strip()
-                if val and len(val) <= 128:
-                    corr_id = val
+                raw_header_val = v
                 break
 
-        if not corr_id:
-            corr_id = str(uuid.uuid4())
+        corr_id = normalize_correlation_id(raw_header_val)
 
         if "state" not in scope:
             scope["state"] = {}
@@ -82,13 +99,12 @@ class RequestSizeLimitMiddleware:
         if "state" in scope and "correlation_id" in scope["state"]:
             corr_id = scope["state"]["correlation_id"]
         else:
+            raw_header_val: bytes | str | None = None
             for k, v in raw_headers:
                 if k.lower() in (b"x-correlation-id", b"x-request-id"):
-                    corr_id = v.decode("latin1", errors="replace").strip()
+                    raw_header_val = v
                     break
-
-        if not corr_id:
-            corr_id = str(uuid.uuid4())
+            corr_id = normalize_correlation_id(raw_header_val)
 
         # Extract Content-Length if present
         content_length_raw: bytes | None = None
