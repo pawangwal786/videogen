@@ -79,6 +79,9 @@ class ResearchRequest(BaseModel):
     research_depth: Literal["quick", "standard", "deep"] = "standard"
     style_guidelines: list[str] = Field(default_factory=list)
     key_aspects_to_cover: list[str] = Field(default_factory=list)
+    model_name: str | None = Field(
+        default=None, description="Explicit model selection identifier propagated from job payload"
+    )
 
 
 class ResearchResult(BaseModel):

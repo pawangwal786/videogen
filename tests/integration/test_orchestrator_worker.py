@@ -89,7 +89,12 @@ async def test_worker_execution_and_two_phase_submission(
     worker = JobWorker(session_factory=session_factory, heartbeat_interval_seconds=1.0)
 
     # Register two-phase handler
-    handler = DummyHandler(output={"result": "ok"}, two_phase=True)
+    art_id = str(uuid.uuid4())
+    art_checksum = "a" * 64
+    handler = DummyHandler(
+        output={"_artifact_id": art_id, "_checksum": art_checksum, "result": "ok"},
+        two_phase=True,
+    )
     worker.register_handler("research", handler)
 
     wf = await orchestrator.create_workflow(topic="Deep Learning History")
@@ -106,7 +111,11 @@ async def test_worker_execution_and_two_phase_submission(
         jobs = await job_repo.list_jobs_for_workflow(wf.id)
         job_summary = next(j for j in jobs if j.logical_key == "research")
         assert job_summary.status == JobStatus.COMPLETED.value
-        assert job_summary.output_payload == {"result": "ok"}
+        assert job_summary.output_payload == {
+            "_artifact_id": art_id,
+            "_checksum": art_checksum,
+            "result": "ok",
+        }
 
         # Attempt should have provider operation ID recorded
         full_job = await job_repo.get_job(job_summary.id, load_attempts=True)
@@ -157,7 +166,16 @@ async def test_full_pipeline_stage_progression(
     worker = JobWorker(session_factory=session_factory)
 
     # Register handlers for all pipeline stages
-    worker.register_handler("research", DummyHandler(output={"summary": "Key research points"}))
+    worker.register_handler(
+        "research",
+        DummyHandler(
+            output={
+                "_artifact_id": str(uuid.uuid4()),
+                "_checksum": "a" * 64,
+                "summary": "Key research points",
+            }
+        ),
+    )
     worker.register_handler("script", DummyHandler(output={"narration": "Script narration"}))
     worker.register_handler(
         "storyboard",
@@ -260,8 +278,16 @@ async def test_advance_workflow_concurrent_idempotency(
         await session.flush()
         r_job.status = JobStatus.CLAIMED.value
         r_job.current_attempt_id = attempt.id
-        await session.flush()
-        await job_repo.complete_job(r_job.id, "test-worker", token, {"findings": "verified"})
+        await job_repo.complete_job(
+            r_job.id,
+            "test-worker",
+            token,
+            {
+                "_artifact_id": str(uuid.uuid4()),
+                "_checksum": "a" * 64,
+                "findings": "verified",
+            },
+        )
         await session.commit()
 
     # Advance workflow concurrently from 10 independent callers

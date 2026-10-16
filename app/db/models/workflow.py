@@ -49,6 +49,7 @@ class WorkflowModel(Base, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
     )
+    qc_verdict: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     # Relationships
     jobs: Mapped[list["JobModel"]] = relationship(

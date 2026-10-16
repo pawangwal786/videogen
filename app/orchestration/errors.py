@@ -63,9 +63,19 @@ class JobNotFoundError(OrchestrationError):
 class LeaseConflictError(OrchestrationError):
     """Raised when a lease heartbeat or completion check fails due to ownership conflict."""
 
-    def __init__(self, job_id: str, worker_id: str | None, lease_token: str | None) -> None:
+    def __init__(
+        self,
+        job_id: str,
+        worker_id: str | None,
+        lease_token: str | None,
+        message: str | None = None,
+    ) -> None:
+        msg = (
+            message
+            or f"Lease conflict for job '{job_id}': worker '{worker_id}' with lease token '{lease_token}' does not own the active lease."
+        )
         super().__init__(
-            f"Lease conflict for job '{job_id}': worker '{worker_id}' with lease token '{lease_token}' does not own the active lease.",
+            msg,
             code="LEASE_CONFLICT",
             details={"job_id": job_id, "worker_id": worker_id, "lease_token": lease_token},
         )
@@ -120,3 +130,14 @@ class ProviderReconciliationRequiredError(OrchestrationError):
         self.job_id = job_id
         self.attempt_id = attempt_id
         self.submission_token = submission_token
+
+
+class InvariantViolationError(OrchestrationError):
+    """Raised when a system or domain invariant is violated."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(
+            message,
+            code="INVARIANT_VIOLATION",
+            details=details or {},
+        )

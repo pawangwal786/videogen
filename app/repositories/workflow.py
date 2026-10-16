@@ -92,6 +92,7 @@ class WorkflowRepository:
         current_stage: str | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
+        qc_verdict: str | None = None,
     ) -> WorkflowModel:
         """Update workflow status and optional stage/error details, validating state transition."""
         workflow = await self.get_workflow(workflow_id)
@@ -106,6 +107,8 @@ class WorkflowRepository:
             workflow.error_code = error_code
         if error_message is not None:
             workflow.error_message = error_message
+        if qc_verdict is not None:
+            workflow.qc_verdict = qc_verdict
         if status in {
             WorkflowStatus.COMPLETED.value,
             WorkflowStatus.FAILED.value,

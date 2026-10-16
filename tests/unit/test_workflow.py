@@ -30,6 +30,16 @@ def test_workflow_domain_model_defaults():
     assert wf.status == WorkflowStatus.PENDING
     assert wf.current_stage == JobStage.RESEARCH
     assert wf.idempotency_key is None
+    assert wf.qc_verdict is None
+
+    wf_passed = Workflow(
+        id=str(uuid.uuid4()),
+        topic="AI infrastructure",
+        qc_verdict="PASS",
+        created_at=now,
+        updated_at=now,
+    )
+    assert wf_passed.qc_verdict == "PASS"
 
 
 def test_job_domain_model_defaults():

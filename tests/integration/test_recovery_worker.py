@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -375,6 +376,8 @@ async def test_resolved_recovery_executes_to_completion(
             else:
                 poll_count += 1
                 return {
+                    "_artifact_id": str(uuid.uuid4()),
+                    "_checksum": "a" * 64,
                     "operation_id": recovered_op,
                     "status": "completed",
                     "brief": {"topic": "Full Recovery Lifecycle", "sections": []},

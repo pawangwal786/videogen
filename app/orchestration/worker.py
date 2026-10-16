@@ -1,11 +1,14 @@
-"""Worker runtime executing claimed jobs with lease heartbeats and safe shutdown."""
-
 import asyncio
+import hashlib
+import json
 import uuid
+from collections.abc import Callable
 from typing import Any, Protocol
 
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config.settings import Settings, get_settings
 from app.db.models.job import JobAttemptModel, JobModel
 from app.db.session import get_session_factory
 from app.logging import get_logger
@@ -13,6 +16,11 @@ from app.orchestration.errors import LeaseConflictError
 from app.orchestration.orchestrator import WorkflowOrchestrator
 from app.orchestration.retry import compute_next_available_at
 from app.repositories.job import JobRepository
+from app.stages.artifact_store import ArtifactStore
+from app.stages.base import StageHandler
+from app.stages.context import EmptyPayload, StageContext
+from app.stages.dto import ArtifactKind, PipelineStage
+from app.stages.runtime import StageExecutionResult, StageRuntime, create_stage_context
 
 logger = get_logger(__name__)
 
@@ -34,6 +42,87 @@ class JobHandler(Protocol):
         ...
 
 
+class _StageHandlerAdapter[TInput: BaseModel, TOutput: BaseModel]:
+    """Bridges typed StageHandler execution into JobWorker using StageRuntime."""
+
+    def __init__(
+        self,
+        handler: StageHandler[TInput, TOutput],
+        stage: PipelineStage,
+        artifact_kind: ArtifactKind,
+        output_type: type[TOutput],
+        artifact_store: ArtifactStore,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        fingerprint_calculator: Callable[[JobModel, StageContext], str] | None = None,
+    ) -> None:
+        self.handler = handler
+        self.stage = stage
+        self.artifact_kind = artifact_kind
+        self.output_type = output_type
+        self.artifact_store = artifact_store
+        self.settings = settings
+        self.session_factory = session_factory
+        self.fingerprint_calculator = fingerprint_calculator
+
+    async def execute(
+        self,
+        job: JobModel,
+        attempt: JobAttemptModel,
+        worker: "JobWorker",
+    ) -> dict[str, Any]:
+        payload_type = (
+            EmptyPayload
+            if getattr(self.handler, "payload_type", EmptyPayload) is BaseModel
+            else getattr(self.handler, "payload_type", EmptyPayload)
+        )
+        payload_model = payload_type.model_validate(job.input_payload or {})
+        context = create_stage_context(
+            workflow_id=job.workflow_id,
+            job_id=job.id,
+            attempt_id=attempt.id,
+            worker_id=worker.worker_id,
+            lease_token=attempt.lease_token or "",
+            attempt_number=attempt.attempt_number,
+            settings=self.settings,
+            payload=payload_model,
+        )
+
+        if self.fingerprint_calculator is not None:
+            fingerprint = self.fingerprint_calculator(job, context)
+        elif hasattr(self.handler, "calculate_fingerprint"):
+            fingerprint = self.handler.calculate_fingerprint(job, context)
+        elif "fingerprint" in job.input_payload:
+            fingerprint = str(job.input_payload["fingerprint"])
+        else:
+            raw = f"{self.stage.value}:{job.logical_key}:{json.dumps(job.input_payload, sort_keys=True)}"
+            fingerprint = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+        async with self.session_factory() as session:
+            runtime = StageRuntime(
+                session=session,
+                store=self.artifact_store,
+                settings=self.settings,
+            )
+
+            result: StageExecutionResult[TOutput] = await runtime.execute_stage(
+                handler=self.handler,
+                context=context,
+                stage=self.stage,
+                artifact_kind=self.artifact_kind,
+                fingerprint=fingerprint,
+                output_type=self.output_type,
+            )
+            await session.commit()
+
+        payload = result.output.model_dump(mode="json")
+        payload["_artifact_id"] = str(result.artifact_id)
+        payload["_storage_path"] = result.storage_path
+        payload["_checksum"] = result.checksum
+        payload["_cached"] = result.cached
+        return payload
+
+
 class JobWorker:
     """Processes background jobs from PostgreSQL using atomic claims and lease heartbeats.
 
@@ -50,12 +139,19 @@ class JobWorker:
         heartbeat_interval_seconds: float = 15.0,
         handlers: dict[str, JobHandler] | None = None,
         orchestrator: WorkflowOrchestrator | None = None,
+        artifact_store: ArtifactStore | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._session_factory = session_factory or get_session_factory()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self._heartbeat_interval = heartbeat_interval_seconds
         self._handlers = handlers or {}
         self._orchestrator = orchestrator or WorkflowOrchestrator(self._session_factory)
+        self._settings = settings or get_settings()
+        self._artifact_store = artifact_store or ArtifactStore(
+            self._settings.get_resolved_artifact_root(),
+            fsync=self._settings.videogen_artifact_fsync,
+        )
 
         self._running = False
         self._shutdown_requested = False
@@ -68,6 +164,28 @@ class JobWorker:
     def register_handler(self, job_type: str, handler: JobHandler) -> None:
         """Register a handler for a specific job_type."""
         self._handlers[job_type] = handler
+
+    def register_stage_handler[TInput: BaseModel, TOutput: BaseModel](
+        self,
+        job_type: str,
+        handler: StageHandler[TInput, TOutput],
+        stage: PipelineStage,
+        artifact_kind: ArtifactKind,
+        output_type: type[TOutput],
+        fingerprint_calculator: Callable[[JobModel, StageContext], str] | None = None,
+    ) -> None:
+        """Register a strongly typed StageHandler with StageRuntime bridge."""
+        adapter = _StageHandlerAdapter(
+            handler=handler,
+            stage=stage,
+            artifact_kind=artifact_kind,
+            output_type=output_type,
+            artifact_store=self._artifact_store,
+            settings=self._settings,
+            session_factory=self._session_factory,
+            fingerprint_calculator=fingerprint_calculator,
+        )
+        self.register_handler(job_type, adapter)
 
     async def record_submission_pending(
         self,
@@ -306,3 +424,62 @@ class JobWorker:
                 pass
             self._main_task = None
         await self._cleanup_active_job()
+
+
+def create_production_worker(
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    settings: Settings | None = None,
+    worker_id: str | None = None,
+    model: Any | None = None,
+) -> JobWorker:
+    """Production composition root constructing a fully wired JobWorker.
+
+    Registers:
+    - ResearchStageHandler with ResearchAgent backed by configured TextModel
+    - ScriptStageHandler with ScriptAgent backed by configured TextModel
+    - Storage and session factory dependencies
+    """
+    from app.agents.research.agent import ResearchAgent
+    from app.agents.research.models import ResearchResult
+    from app.agents.script.agent import ScriptAgent
+    from app.agents.script.models import ScriptResult
+    from app.models.base import TextModel
+    from app.models.router import ModelRouter
+    from app.stages.research import ResearchStageHandler
+    from app.stages.script import ScriptStageHandler
+
+    effective_settings = settings or get_settings()
+    effective_session_factory = session_factory or get_session_factory()
+    text_model: TextModel = model or ModelRouter.from_settings(effective_settings)
+
+    worker = JobWorker(
+        session_factory=effective_session_factory,
+        worker_id=worker_id,
+        settings=effective_settings,
+    )
+
+    research_agent = ResearchAgent(model=text_model)
+    research_handler = ResearchStageHandler(agent=research_agent)
+    worker.register_stage_handler(
+        job_type="research",
+        handler=research_handler,
+        stage=PipelineStage.RESEARCH,
+        artifact_kind=ArtifactKind.RESEARCH_RESULT,
+        output_type=ResearchResult,
+    )
+
+    script_agent = ScriptAgent(model=text_model)
+    script_handler = ScriptStageHandler(
+        session_factory=effective_session_factory,
+        store=worker._artifact_store,
+        agent=script_agent,
+    )
+    worker.register_stage_handler(
+        job_type="script",
+        handler=script_handler,
+        stage=PipelineStage.SCRIPT,
+        artifact_kind=ArtifactKind.SCRIPT_RESULT,
+        output_type=ScriptResult,
+    )
+
+    return worker

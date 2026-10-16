@@ -1,5 +1,6 @@
 """Workflow orchestrator driving state transitions and pipeline stages."""
 
+import uuid
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -8,9 +9,15 @@ from app.db.base import utc_now
 from app.db.models.job import JobAttemptModel
 from app.db.session import get_session_factory
 from app.logging import get_logger
-from app.orchestration.errors import WorkflowNotFoundError
+from app.orchestration.errors import OrchestrationError, WorkflowNotFoundError
 from app.orchestration.models import Artifact, Job, Workflow
-from app.orchestration.state_machine import AttemptStatus, JobStage, JobStatus, WorkflowStatus
+from app.orchestration.state_machine import (
+    AttemptStatus,
+    JobStage,
+    JobStatus,
+    QcVerdict,
+    WorkflowStatus,
+)
 from app.repositories.artifact import ArtifactRepository
 from app.repositories.job import JobRepository
 from app.repositories.workflow import WorkflowRepository
@@ -200,14 +207,45 @@ class WorkflowOrchestrator:
                 r_job = jobs_by_key.get("research")
                 if r_job and r_job.status == JobStatus.COMPLETED.value:
                     if "script" not in jobs_by_key:
+                        output = r_job.output_payload or {}
+                        research_art_id = output.get("_artifact_id")
+                        research_checksum = output.get("_checksum")
+                        if (
+                            not research_art_id
+                            or not isinstance(research_art_id, str)
+                            or not research_art_id.strip()
+                        ):
+                            raise OrchestrationError(
+                                f"Completed research job '{r_job.id}' is missing valid '_artifact_id' in output_payload"
+                            )
+                        try:
+                            art_uuid = uuid.UUID(research_art_id.strip())
+                        except (ValueError, AttributeError):
+                            raise OrchestrationError(
+                                f"Completed research job '{r_job.id}' has malformed UUID '_artifact_id': '{research_art_id}'"
+                            )
+
+                        clean_checksum = (
+                            research_checksum.strip().lower()
+                            if isinstance(research_checksum, str)
+                            else ""
+                        )
+                        if len(clean_checksum) != 64 or not all(
+                            c in "0123456789abcdef" for c in clean_checksum
+                        ):
+                            raise OrchestrationError(
+                                f"Completed research job '{r_job.id}' is missing valid 64-char lowercase hex SHA-256 '_checksum' in output_payload"
+                            )
+
                         await job_repo.create_job(
                             workflow_id=workflow_id,
                             logical_key="script",
                             job_type="script",
                             stage=JobStage.SCRIPT.value,
                             input_payload={
-                                "topic": wf.topic,
-                                "research_output": r_job.output_payload,
+                                "research_artifact_id": str(art_uuid),
+                                "research_artifact_checksum": clean_checksum,
+                                "pacing_wpm": 140,
                             },
                         )
                     await wf_repo.update_status(
@@ -298,6 +336,113 @@ class WorkflowOrchestrator:
             elif current_stage == JobStage.MEDIA_ASSEMBLY:
                 assembly_job = jobs_by_key.get("media_assembly")
                 if assembly_job and assembly_job.status == JobStatus.COMPLETED.value:
+                    await wf_repo.update_status(
+                        workflow_id,
+                        status=WorkflowStatus.COMPLETED.value,
+                        current_stage=JobStage.COMPLETED.value,
+                    )
+
+            elif current_stage == JobStage.MEDIA_SYNTHESIS:
+                ms_job = jobs_by_key.get("media_synthesis")
+                if ms_job and ms_job.status == JobStatus.COMPLETED.value:
+                    if "audio" not in jobs_by_key:
+                        await job_repo.create_job(
+                            workflow_id=workflow_id,
+                            logical_key="audio",
+                            job_type="audio",
+                            stage=JobStage.AUDIO.value,
+                            input_payload={
+                                "workflow_id": workflow_id,
+                                "media_synthesis_output": ms_job.output_payload,
+                            },
+                        )
+                    await wf_repo.update_status(
+                        workflow_id,
+                        status=WorkflowStatus.RUNNING.value,
+                        current_stage=JobStage.AUDIO.value,
+                    )
+
+            elif current_stage == JobStage.AUDIO:
+                audio_job = jobs_by_key.get("audio")
+                if audio_job and audio_job.status == JobStatus.COMPLETED.value:
+                    if "assembly" not in jobs_by_key:
+                        await job_repo.create_job(
+                            workflow_id=workflow_id,
+                            logical_key="assembly",
+                            job_type="assembly",
+                            stage=JobStage.ASSEMBLY.value,
+                            input_payload={
+                                "workflow_id": workflow_id,
+                                "audio_output": audio_job.output_payload,
+                            },
+                        )
+                    await wf_repo.update_status(
+                        workflow_id,
+                        status=WorkflowStatus.RUNNING.value,
+                        current_stage=JobStage.ASSEMBLY.value,
+                    )
+
+            elif current_stage == JobStage.ASSEMBLY:
+                assembly_job = jobs_by_key.get("assembly")
+                if assembly_job and assembly_job.status == JobStatus.COMPLETED.value:
+                    if "qc" not in jobs_by_key:
+                        await job_repo.create_job(
+                            workflow_id=workflow_id,
+                            logical_key="qc",
+                            job_type="qc",
+                            stage=JobStage.QC.value,
+                            input_payload={
+                                "workflow_id": workflow_id,
+                                "assembly_output": assembly_job.output_payload,
+                            },
+                        )
+                    await wf_repo.update_status(
+                        workflow_id,
+                        status=WorkflowStatus.RUNNING.value,
+                        current_stage=JobStage.QC.value,
+                    )
+
+            elif current_stage == JobStage.QC:
+                qc_job = jobs_by_key.get("qc")
+                if qc_job and qc_job.status == JobStatus.COMPLETED.value:
+                    payload = qc_job.output_payload or {}
+                    verdict = payload.get("verdict") or payload.get("qc_verdict")
+                    if verdict == QcVerdict.PASS.value:
+                        await wf_repo.update_status(
+                            workflow_id,
+                            status=WorkflowStatus.RUNNING.value,
+                            current_stage=JobStage.PUBLISH.value,
+                            qc_verdict=QcVerdict.PASS.value,
+                        )
+                        if "publish" not in jobs_by_key:
+                            await job_repo.create_job(
+                                workflow_id=workflow_id,
+                                logical_key="publish",
+                                job_type="publish",
+                                stage=JobStage.PUBLISH.value,
+                                input_payload={
+                                    "workflow_id": workflow_id,
+                                    "qc_output": qc_job.output_payload,
+                                },
+                            )
+                    else:
+                        failure_reasons = payload.get("failure_reasons", [])
+                        reason_msg = (
+                            "; ".join(failure_reasons)
+                            if failure_reasons
+                            else f"QC verdict was '{verdict}'"
+                        )
+                        await wf_repo.update_status(
+                            workflow_id,
+                            status=WorkflowStatus.FAILED.value,
+                            error_code="QC_VERDICT_FAILED",
+                            error_message=f"QC quality gate rejected workflow: {reason_msg}",
+                            qc_verdict=QcVerdict.FAIL.value,
+                        )
+
+            elif current_stage == JobStage.PUBLISH:
+                publish_job = jobs_by_key.get("publish")
+                if publish_job and publish_job.status == JobStatus.COMPLETED.value:
                     await wf_repo.update_status(
                         workflow_id,
                         status=WorkflowStatus.COMPLETED.value,

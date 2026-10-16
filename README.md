@@ -166,6 +166,14 @@ Artifact metadata returned by `GET /workflows/{id}/artifacts` is projected throu
 }
 ```
 
+### Observability & Correlation ID Contract
+
+All inbound HTTP requests are tracked and correlated across middleware, handlers, and background logs using the `X-Correlation-ID` header:
+- **Whitespace Normalization**: Caller-provided correlation IDs are normalized with leading and trailing whitespace stripped (`raw.strip()`). For example, `"  req-batch-001  "` becomes `"req-batch-001"`.
+- **Constrained Grammar**: The ID must strictly conform to the ASCII regex `^[a-zA-Z0-9._:-]{1,64}$` (1 to 64 alphanumeric characters, periods, underscores, colons, or hyphens).
+- **Fallback Semantics**: If the header is missing, empty, whitespace-only, contains disallowed characters (e.g. control chars, spaces, unicode), or exceeds 64 characters, the server automatically discards it and generates a clean UUID4.
+- **Propagation**: The normalized ID is attached to the request state, injected into the request-scoped `structlog` context for all log records, and echoed back on every HTTP response in the `X-Correlation-ID` header as well as in the standard error envelope.
+
 ---
 
 ## Rate Limiting Topology
@@ -243,36 +251,44 @@ Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
 
 ## Testing & Quality Gates
 
-The test suite enforces full statement and branch coverage across the orchestration and API control plane.
+The test suite enforces full statement and branch coverage across the orchestration, persistence, and API control plane layers.
 
-### Run Tests with Coverage
-
-```bash
-# Run all tests with statement coverage (enforces >= 90.0% threshold)
-uv run pytest --cov=app --cov-report=term-missing
-
-# Run API integration tests against local PostgreSQL
-uv run pytest tests/integration/test_api_endpoints.py -v
-```
-
-### Static Analysis & Linter Verification
+### Local Verification Commands
 
 ```bash
-# Verify linting
+# Verify static linting
 uv run ruff check .
 
-# Verify formatting
+# Verify code formatting
 uv run ruff format --check .
 
-# Verify database schema parity (zero pending migrations)
+# Verify bytecode compilation and import integrity
+uv run python -m compileall app
+
+# Apply database migrations
+uv run alembic upgrade head
+
+# Verify database schema parity (detects any unmigrated model changes)
 uv run alembic check
+
+# Run full test suite with branch and statement coverage (enforces >= 90.0% threshold)
+uv run pytest --cov=app --cov-branch --cov-report=term-missing
 ```
+
+### Automated Remote CI Pipeline
+
+All quality gates are enforced automatically on every push and pull request to `main` via the GitHub Actions CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
+- Runs on `ubuntu-latest` against a dedicated **PostgreSQL 16** service container (`postgres:16-alpine`).
+- Enforces frozen dependency synchronization via `uv sync --frozen --all-extras`.
+- Sequentially executes Ruff linting, Ruff format check, `python -m compileall`, Alembic migrations, Alembic schema checks, and the complete Pytest suite with branch coverage enforcement ($\ge 90.0\%$).
 
 ---
 
 ## Deployment
 
-In production environments, run the application using Uvicorn or Gunicorn with Uvicorn workers:
+### Recommended Deployment Command
+
+Run the ASGI control plane using Uvicorn with worker processes configured for your host capacity:
 
 ```bash
 VIDEOGEN_ENV=production \
@@ -281,3 +297,10 @@ VIDEOGEN_DATABASE_URL="postgresql+asyncpg://app_user:strong_password@db-instance
 GEMINI_API_KEY="your-gemini-key" \
 uv run uvicorn app.api.main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
+
+> [!NOTE]
+> **Operational Topology & Process Isolation**:
+> The command above is a deployment configuration, not proof that 4-worker production operation has been benchmarked for your specific infrastructure.
+> Operating with multiple Uvicorn worker processes has concrete architectural implications:
+> 1. **Process Isolation**: Each Uvicorn worker runs as an independent OS process with its own Python interpreter, its own SQLAlchemy async engine, and its own database connection pool (`pool_size=10, max_overflow=5` by default). Four workers will open up to 60 concurrent database connections. Ensure your PostgreSQL instance's `max_connections` setting accommodates this total along with asynchronous background workers.
+> 2. **Per-Process Rate Limiting**: The built-in in-memory rate limiter operates **per worker process** (e.g., 60 requests/minute per worker process), not globally synchronized across the cluster. If strict cluster-wide rate limiting is required across multi-worker or multi-host deployments, a shared Redis-backed rate limiter should be introduced behind the `RateLimiter` interface. For current control-plane workloads, per-process limits remain sufficient.

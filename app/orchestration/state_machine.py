@@ -44,9 +44,16 @@ class JobStage(StrEnum):
     RESEARCH = "RESEARCH"
     SCRIPT = "SCRIPT"
     STORYBOARD = "STORYBOARD"
+    MEDIA_SYNTHESIS = "MEDIA_SYNTHESIS"
+    AUDIO = "AUDIO"
+    ASSEMBLY = "ASSEMBLY"
+    QC = "QC"
+    PUBLISH = "PUBLISH"
+    COMPLETED = "COMPLETED"
+
+    # Legacy backward-compatibility aliases
     VIDEO_GENERATION = "VIDEO_GENERATION"
     MEDIA_ASSEMBLY = "MEDIA_ASSEMBLY"
-    COMPLETED = "COMPLETED"
 
 
 class ArtifactLifecycleStatus(StrEnum):
@@ -54,8 +61,16 @@ class ArtifactLifecycleStatus(StrEnum):
 
     PENDING = "PENDING"
     AVAILABLE = "AVAILABLE"
+    SUPERSEDED = "SUPERSEDED"
     PURGED = "PURGED"
     FAILED = "FAILED"
+
+
+class QcVerdict(StrEnum):
+    """Quality control verdict outcome."""
+
+    PASS = "PASS"
+    FAIL = "FAIL"
 
 
 # Valid state transitions
@@ -168,3 +183,36 @@ def is_terminal_attempt_status(status: AttemptStatus) -> bool:
         AttemptStatus.EXPIRED,
         AttemptStatus.CANCELLED,
     }
+
+
+_ARTIFACT_LIFECYCLE_TRANSITIONS: dict[ArtifactLifecycleStatus, set[ArtifactLifecycleStatus]] = {
+    ArtifactLifecycleStatus.PENDING: {
+        ArtifactLifecycleStatus.AVAILABLE,
+        ArtifactLifecycleStatus.FAILED,
+    },
+    ArtifactLifecycleStatus.AVAILABLE: {
+        ArtifactLifecycleStatus.SUPERSEDED,
+    },
+    ArtifactLifecycleStatus.SUPERSEDED: set(),
+    ArtifactLifecycleStatus.PURGED: set(),
+    ArtifactLifecycleStatus.FAILED: set(),
+}
+
+
+def validate_artifact_lifecycle_transition(
+    current: ArtifactLifecycleStatus, next_status: ArtifactLifecycleStatus
+) -> None:
+    """Ensure the requested artifact lifecycle transition is allowed.
+
+    Monotonic lifecycle graph:
+        PENDING  → AVAILABLE
+        PENDING  → FAILED
+        AVAILABLE → SUPERSEDED
+
+    FAILED, SUPERSEDED, and PURGED are terminal states with no outgoing edges.
+    """
+    if current == next_status:
+        return
+    allowed = _ARTIFACT_LIFECYCLE_TRANSITIONS.get(current, set())
+    if next_status not in allowed:
+        raise InvalidStateTransitionError("ArtifactLifecycle", current.value, next_status.value)

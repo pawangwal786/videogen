@@ -62,6 +62,10 @@ def test_workflow_model_instantiation():
     assert wf.error_code is None
     assert wf.error_message is None
     assert wf.completed_at is None
+    assert wf.qc_verdict is None
+
+    wf.qc_verdict = "PASS"
+    assert wf.qc_verdict == "PASS"
 
 
 def test_job_model_instantiation():

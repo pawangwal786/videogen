@@ -3,6 +3,7 @@
 from app.orchestration.errors import (
     IdempotencyConflictError,
     InvalidStateTransitionError,
+    InvariantViolationError,
     JobNotFoundError,
     LeaseConflictError,
     MaxAttemptsExceededError,
@@ -31,11 +32,12 @@ from app.orchestration.state_machine import (
     is_terminal_attempt_status,
     is_terminal_job_status,
     is_terminal_workflow_status,
+    validate_artifact_lifecycle_transition,
     validate_attempt_transition,
     validate_job_transition,
     validate_workflow_transition,
 )
-from app.orchestration.worker import JobHandler, JobWorker
+from app.orchestration.worker import JobHandler, JobWorker, create_production_worker
 
 __all__ = [
     "Artifact",
@@ -44,6 +46,7 @@ __all__ = [
     "ClaimedJob",
     "IdempotencyConflictError",
     "InvalidStateTransitionError",
+    "InvariantViolationError",
     "Job",
     "JobAttempt",
     "JobHandler",
@@ -66,9 +69,11 @@ __all__ = [
     "WorkflowStatus",
     "compute_next_available_at",
     "compute_retry_delay",
+    "create_production_worker",
     "is_terminal_attempt_status",
     "is_terminal_job_status",
     "is_terminal_workflow_status",
+    "validate_artifact_lifecycle_transition",
     "validate_attempt_transition",
     "validate_job_transition",
     "validate_workflow_transition",

@@ -11,13 +11,18 @@ from sqlalchemy.orm import selectinload
 
 from app.db.base import utc_now
 from app.db.models.job import JobAttemptModel, JobModel
+from app.db.models.workflow import WorkflowModel
 from app.orchestration.errors import (
+    InvariantViolationError,
     JobNotFoundError,
     LeaseConflictError,
+    WorkflowNotFoundError,
 )
 from app.orchestration.state_machine import (
     AttemptStatus,
+    JobStage,
     JobStatus,
+    QcVerdict,
     validate_attempt_transition,
     validate_job_transition,
 )
@@ -72,6 +77,17 @@ class JobRepository:
         available_at: datetime | None = None,
     ) -> JobModel:
         """Create a job idempotently. If (workflow_id, logical_key) exists, return existing."""
+        if stage in {JobStage.PUBLISH.value, "PUBLISH"}:
+            stmt = select(WorkflowModel).where(WorkflowModel.id == workflow_id).with_for_update()
+            wf = (await self._session.execute(stmt)).scalar_one_or_none()
+            if wf is None:
+                raise WorkflowNotFoundError(workflow_id)
+            if wf.qc_verdict != QcVerdict.PASS.value:
+                raise InvariantViolationError(
+                    f"Cannot create PUBLISH job for workflow '{workflow_id}': "
+                    f"QC verdict is '{wf.qc_verdict}', must be 'PASS'."
+                )
+
         existing = await self.get_by_logical_key(workflow_id, logical_key)
         if existing is not None:
             return existing

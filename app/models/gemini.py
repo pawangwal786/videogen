@@ -43,9 +43,11 @@ class GeminiTextModel:
         prompt: str,
         *,
         system_prompt: str | None = None,
+        model_name: str | None = None,
     ) -> str:
         """Generate text from Gemini with structured logging, timeout, and normalized errors."""
         start_time = time.perf_counter()
+        target_model = model_name.strip() if model_name and model_name.strip() else self.model_name
         config = (
             types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -57,7 +59,7 @@ class GeminiTextModel:
         try:
             response = await asyncio.wait_for(
                 self._client.aio.models.generate_content(
-                    model=self.model_name,
+                    model=target_model,
                     contents=prompt,
                     config=config,
                 ),
@@ -76,7 +78,7 @@ class GeminiTextModel:
             logger.info(
                 "model.generate",
                 provider="gemini",
-                model=self.model_name,
+                model=target_model,
                 prompt_length=len(prompt),
                 duration_ms=round(duration_ms, 2),
                 success=True,

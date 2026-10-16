@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Self
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -25,6 +26,9 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     gemini_model: str = "gemini-2.5-flash"
     veo_model: str = "veo-2.0-generate-001"
+    veo_timeout_seconds: float = Field(default=300.0, gt=0.0)
+    veo_poll_interval_seconds: float = Field(default=5.0, gt=0.0)
+    veo_max_poll_attempts: int = Field(default=60, ge=1)
 
     # OpenRouter
     openrouter_api_key: SecretStr | None = None
@@ -51,6 +55,19 @@ class Settings(BaseSettings):
     media_pixel_format: str = Field(default="yuv420p", min_length=1)
     media_audio_codec: str = Field(default="aac", min_length=1)
     media_duration_tolerance_seconds: float = Field(default=0.5, ge=0.0)
+
+    # Artifact Storage
+    videogen_artifact_root: str = Field(
+        default="data/artifacts",
+        min_length=1,
+        description="Base directory for pipeline artifact storage. "
+        "Relative paths are resolved against CWD. "
+        "Production deployments should use an absolute path.",
+    )
+    videogen_artifact_fsync: bool = Field(
+        default=True,
+        description="Enable fsync file and directory synchronization for crash durability.",
+    )
 
     @field_validator(
         "ffmpeg_binary",
@@ -195,10 +212,34 @@ class Settings(BaseSettings):
                     "OPENROUTER_API_KEY is required in production when OpenRouter is configured as primary or fallback provider."
                 )
 
+            # 5. Artifact root must be an absolute path in production
+            is_abs = Path(
+                self.videogen_artifact_root
+            ).is_absolute() or self.videogen_artifact_root.startswith("/")
+            if not is_abs:
+                raise ValueError(
+                    f"VIDEOGEN_ARTIFACT_ROOT must be an absolute path in production, got '{self.videogen_artifact_root}'. "
+                    "Ensure all production workers share the same absolute mount or directory."
+                )
+
         return self
 
     # Integration testing safety
     videogen_run_external_tests: bool = False
+
+    def get_resolved_artifact_root(self) -> Path:
+        """Return absolute resolved path to the artifact root directory.
+
+        In production mode, VIDEOGEN_ARTIFACT_ROOT is validated to be an absolute path.
+        In development/test modes, relative paths are deterministically anchored against
+        the application/repository root directory (parent of app) rather than the current
+        process working directory (CWD), guaranteeing consistency across workers.
+        """
+        path = Path(self.videogen_artifact_root)
+        if path.is_absolute():
+            return path.resolve()
+        app_root = Path(__file__).resolve().parent.parent.parent
+        return (app_root / path).resolve()
 
     def get_database_url(self, for_test: bool = False) -> str:
         """Resolve the effective database URL, prioritizing test database URL if requested."""
@@ -214,6 +255,11 @@ class Settings(BaseSettings):
                 provider="gemini",
             )
         return self.gemini_api_key.get_secret_value().strip()
+
+    def require_veo(self) -> tuple[str, str]:
+        """Validate and return (api_key, model_name) for Veo, or raise ModelConfigurationError."""
+        api_key = self.require_gemini()
+        return (api_key, self.veo_model.strip())
 
     def require_openrouter(self) -> tuple[str, str, str]:
         """Validate and return (api_key, base_url, model) or raise ModelConfigurationError."""

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import SecretStr
 
@@ -185,6 +187,7 @@ def test_production_settings_validation_matrix():
         "database_url": "postgresql+asyncpg://app_user:strong_prod_pass@db.prod.internal:5432/videogen_prod",
         "gemini_api_key": SecretStr("valid-gemini-key"),
         "openrouter_api_key": SecretStr("valid-openrouter-key"),
+        "videogen_artifact_root": "/var/lib/videogen/artifacts",
         "videogen_log_level": "INFO",
     }
 
@@ -221,12 +224,19 @@ def test_production_settings_validation_matrix():
             }
         )
 
-    # 5. Verbose logging (DEBUG / TRACE) in production fails
+    # 5. Relative artifact root in production fails
+    for rel_path in ("data/artifacts", "./artifacts", "relative/dir"):
+        with pytest.raises(
+            ValidationError, match="VIDEOGEN_ARTIFACT_ROOT must be an absolute path in production"
+        ):
+            Settings(**{**valid_prod_kwargs, "videogen_artifact_root": rel_path})
+
+    # 6. Verbose logging (DEBUG / TRACE) in production fails
     for bad_log in ("DEBUG", "TRACE", "debug", "trace"):
         with pytest.raises(ValidationError, match="VIDEOGEN_LOG_LEVEL cannot be set to"):
             Settings(**{**valid_prod_kwargs, "videogen_log_level": bad_log})
 
-    # 6. Invalid log level fails across all environments
+    # 7. Invalid log level fails across all environments
     with pytest.raises(ValidationError, match="Invalid VIDEOGEN_LOG_LEVEL"):
         Settings(_env_file=None, videogen_env="development", videogen_log_level="SUPER_VERBOSE")
 
@@ -323,6 +333,27 @@ def test_production_auth_via_environment_variables(monkeypatch: pytest.MonkeyPat
         Settings(_env_file=None)
 
     monkeypatch.setenv("VIDEOGEN_API_AUTH_TOKEN", "valid-env-secret")
+    monkeypatch.setenv("VIDEOGEN_ARTIFACT_ROOT", "/var/lib/videogen/artifacts")
     s = Settings(_env_file=None)
     assert s.api_auth_token is not None
     assert s.api_auth_token.get_secret_value() == "valid-env-secret"
+    assert s.videogen_artifact_root == "/var/lib/videogen/artifacts"
+
+
+def test_artifact_root_resolution_anchoring(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Verify that relative artifact roots are deterministically anchored against project root independent of CWD."""
+    # 1. Default relative root anchors to project root
+    s = Settings(
+        _env_file=None, videogen_env="development", videogen_artifact_root="data/artifacts"
+    )
+    expected_root = Path(__file__).resolve().parent.parent.parent / "data" / "artifacts"
+    assert s.get_resolved_artifact_root() == expected_root.resolve()
+
+    # 2. Changing process working directory does NOT alter resolved path
+    monkeypatch.chdir(tmp_path)
+    assert s.get_resolved_artifact_root() == expected_root.resolve()
+
+    # 3. Absolute root resolves to itself
+    custom_abs = (tmp_path / "custom_artifacts").resolve()
+    s_abs = Settings(_env_file=None, videogen_artifact_root=str(custom_abs))
+    assert s_abs.get_resolved_artifact_root() == custom_abs

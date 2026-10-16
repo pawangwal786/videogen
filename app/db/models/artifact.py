@@ -3,7 +3,7 @@
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import BigInteger, ForeignKey, Index, String
+from sqlalchemy import BigInteger, ForeignKey, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, JSONVariant, TimestampMixin
@@ -72,6 +72,22 @@ class ArtifactModel(Base, TimestampMixin):
         nullable=True,
     )
 
+    # Phase 9 columns: pipeline stage, idempotency fingerprint, artifact kind
+    stage: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+        index=True,
+    )
+    stage_fingerprint: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        index=True,
+    )
+    artifact_kind: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+    )
+
     # Relationships
     workflow: Mapped["WorkflowModel"] = relationship(
         "WorkflowModel",
@@ -82,4 +98,25 @@ class ArtifactModel(Base, TimestampMixin):
         back_populates="artifacts",
     )
 
-    __table_args__ = (Index("ix_artifacts_workflow_type", "workflow_id", "artifact_type"),)
+    __table_args__ = (
+        Index("ix_artifacts_workflow_type", "workflow_id", "artifact_type"),
+        # Composite index for Phase 9 fingerprint lookup queries
+        Index(
+            "ix_artifacts_stage_fingerprint_lookup",
+            "workflow_id",
+            "stage",
+            "stage_fingerprint",
+            "lifecycle_status",
+        ),
+        # Partial unique index: prevents concurrent workers from creating
+        # duplicate PENDING or AVAILABLE artifacts for the same fingerprint.
+        # This is the claim exclusion mechanism for idempotency safety.
+        Index(
+            "uq_artifacts_active_fingerprint",
+            "workflow_id",
+            "stage",
+            "stage_fingerprint",
+            unique=True,
+            postgresql_where=text("lifecycle_status IN ('PENDING', 'AVAILABLE')"),
+        ),
+    )

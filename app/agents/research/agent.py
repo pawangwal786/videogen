@@ -78,17 +78,22 @@ class ResearchAgent(Agent[ResearchRequest, ResearchResult]):
         start_time = time.perf_counter()
         user_prompt = build_research_user_prompt(input)
 
+        effective_model = input.model_name or getattr(
+            self._model, "model_identity", getattr(self._model, "model_name", "unknown")
+        )
         logger.info(
             "agent.research.start",
             workflow_id=str(input.workflow_id),
             topic=input.topic,
             research_depth=input.research_depth,
+            model_name=effective_model,
         )
 
         try:
             raw_response = await self._model.generate(
                 prompt=user_prompt,
                 system_prompt=self.system_prompt,
+                model_name=input.model_name,
             )
         except ModelError as e:
             duration_ms = (time.perf_counter() - start_time) * 1000.0

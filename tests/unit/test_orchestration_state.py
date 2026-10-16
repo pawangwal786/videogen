@@ -2,9 +2,12 @@
 
 import uuid
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.db.models.job import JobModel
+from app.db.models.workflow import WorkflowModel
 from app.orchestration import (
     Artifact,
     ArtifactLifecycleStatus,
@@ -27,10 +30,12 @@ from app.orchestration import (
     is_terminal_attempt_status,
     is_terminal_job_status,
     is_terminal_workflow_status,
+    validate_artifact_lifecycle_transition,
     validate_attempt_transition,
     validate_job_transition,
     validate_workflow_transition,
 )
+from app.orchestration.orchestrator import WorkflowOrchestrator
 
 
 def test_workflow_state_transitions():
@@ -209,3 +214,173 @@ def test_domain_models():
     )
     assert art.artifact_type == "RESEARCH_REPORT"
     assert art.lifecycle_status == ArtifactLifecycleStatus.AVAILABLE
+
+
+def test_artifact_lifecycle_transitions():
+    # Valid transitions
+    validate_artifact_lifecycle_transition(
+        ArtifactLifecycleStatus.PENDING, ArtifactLifecycleStatus.AVAILABLE
+    )
+    validate_artifact_lifecycle_transition(
+        ArtifactLifecycleStatus.PENDING, ArtifactLifecycleStatus.FAILED
+    )
+    validate_artifact_lifecycle_transition(
+        ArtifactLifecycleStatus.AVAILABLE, ArtifactLifecycleStatus.SUPERSEDED
+    )
+    validate_artifact_lifecycle_transition(
+        ArtifactLifecycleStatus.PENDING, ArtifactLifecycleStatus.PENDING
+    )  # no-op
+    validate_artifact_lifecycle_transition(
+        ArtifactLifecycleStatus.AVAILABLE, ArtifactLifecycleStatus.AVAILABLE
+    )  # no-op
+
+    # Invalid transitions
+    with pytest.raises(InvalidStateTransitionError) as exc_info:
+        validate_artifact_lifecycle_transition(
+            ArtifactLifecycleStatus.AVAILABLE, ArtifactLifecycleStatus.PENDING
+        )
+    assert exc_info.value.code == "INVALID_TRANSITION"
+    assert exc_info.value.entity_type == "ArtifactLifecycle"
+
+    with pytest.raises(InvalidStateTransitionError):
+        validate_artifact_lifecycle_transition(
+            ArtifactLifecycleStatus.SUPERSEDED, ArtifactLifecycleStatus.AVAILABLE
+        )
+
+    with pytest.raises(InvalidStateTransitionError):
+        validate_artifact_lifecycle_transition(
+            ArtifactLifecycleStatus.FAILED, ArtifactLifecycleStatus.AVAILABLE
+        )
+
+    with pytest.raises(InvalidStateTransitionError):
+        validate_artifact_lifecycle_transition(
+            ArtifactLifecycleStatus.PURGED, ArtifactLifecycleStatus.AVAILABLE
+        )
+
+    with pytest.raises(InvalidStateTransitionError):
+        validate_artifact_lifecycle_transition(
+            ArtifactLifecycleStatus.AVAILABLE, ArtifactLifecycleStatus.FAILED
+        )
+
+
+@pytest.mark.asyncio
+async def test_advance_workflow_creates_artifact_driven_script_job(monkeypatch):
+    """Verify advance_workflow creates script jobs referencing durable artifacts, not embedded payloads."""
+    from datetime import UTC, datetime
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.db.models.job import JobModel
+    from app.db.models.workflow import WorkflowModel
+    from app.orchestration.orchestrator import WorkflowOrchestrator
+
+    wf_id = str(uuid.uuid4())
+    art_id = str(uuid.uuid4())
+    checksum = "a" * 64
+    now = datetime.now(UTC)
+
+    wf_model = WorkflowModel(
+        id=wf_id,
+        topic="Quantum Computing",
+        current_stage="RESEARCH",
+        status="RUNNING",
+        created_at=now,
+        updated_at=now,
+    )
+    r_job = JobModel(
+        id=str(uuid.uuid4()),
+        workflow_id=wf_id,
+        logical_key="research",
+        job_type="research",
+        stage="RESEARCH",
+        status=JobStatus.COMPLETED.value,
+        output_payload={"_artifact_id": art_id, "_checksum": checksum, "other": "ignored"},
+    )
+
+    mock_wf_repo = AsyncMock()
+    mock_wf_repo.get_workflow_for_update.return_value = wf_model
+    mock_wf_repo.get_workflow.return_value = wf_model
+
+    mock_job_repo = AsyncMock()
+    mock_job_repo.list_jobs_for_workflow.return_value = [r_job]
+
+    session = AsyncMock()
+    session_factory = MagicMock()
+    session_factory.return_value.__aenter__.return_value = session
+    session_factory.return_value.__aexit__.return_value = None
+
+    orchestrator = WorkflowOrchestrator(session_factory=session_factory)
+    monkeypatch.setattr("app.orchestration.orchestrator.WorkflowRepository", lambda s: mock_wf_repo)
+    monkeypatch.setattr("app.orchestration.orchestrator.JobRepository", lambda s: mock_job_repo)
+
+    await orchestrator.advance_workflow(wf_id)
+
+    mock_job_repo.create_job.assert_awaited_once()
+    kwargs = mock_job_repo.create_job.await_args.kwargs
+    assert kwargs["workflow_id"] == wf_id
+    assert kwargs["logical_key"] == "script"
+    assert kwargs["stage"] == "SCRIPT"
+    input_payload = kwargs["input_payload"]
+    assert input_payload["research_artifact_id"] == art_id
+    assert input_payload["research_artifact_checksum"] == checksum
+    assert "research_output" not in input_payload
+
+
+@pytest.mark.asyncio
+async def test_advance_workflow_missing_artifact_metadata_raises_and_halts(monkeypatch):
+    """If completed research job lacks _artifact_id or _checksum, raise OrchestrationError and halt."""
+    from app.orchestration.errors import OrchestrationError
+
+    wf_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    wf_model = WorkflowModel(
+        id=wf_id,
+        topic="Quantum Computing",
+        current_stage="RESEARCH",
+        status="RUNNING",
+        created_at=now,
+        updated_at=now,
+    )
+    r_job = JobModel(
+        id=str(uuid.uuid4()),
+        workflow_id=wf_id,
+        logical_key="research",
+        job_type="research",
+        stage="RESEARCH",
+        status=JobStatus.COMPLETED.value,
+        output_payload={
+            "_artifact_id": "",
+            "_checksum": "bad",
+        },  # Missing/malformed _artifact_id and _checksum
+    )
+
+    mock_wf_repo = AsyncMock()
+    mock_wf_repo.get_workflow_for_update.return_value = wf_model
+    mock_job_repo = AsyncMock()
+    mock_job_repo.list_jobs_for_workflow.return_value = [r_job]
+
+    session = AsyncMock()
+    session_factory = MagicMock()
+    session_factory.return_value.__aenter__.return_value = session
+    session_factory.return_value.__aexit__.return_value = None
+
+    orchestrator = WorkflowOrchestrator(session_factory=session_factory)
+    monkeypatch.setattr("app.orchestration.orchestrator.WorkflowRepository", lambda s: mock_wf_repo)
+    monkeypatch.setattr("app.orchestration.orchestrator.JobRepository", lambda s: mock_job_repo)
+
+    with pytest.raises(OrchestrationError, match="missing valid '_artifact_id'"):
+        await orchestrator.advance_workflow(wf_id)
+
+    # 2. Malformed UUID
+    r_job.output_payload = {"_artifact_id": "not-a-valid-uuid", "_checksum": "a" * 64}
+    with pytest.raises(OrchestrationError, match="malformed UUID"):
+        await orchestrator.advance_workflow(wf_id)
+
+    # 3. Malformed non-hex checksum
+    r_job.output_payload = {"_artifact_id": str(uuid.uuid4()), "_checksum": "z" * 64}
+    with pytest.raises(OrchestrationError, match="missing valid 64-char lowercase hex SHA-256"):
+        await orchestrator.advance_workflow(wf_id)
+
+    # Workflow status must NOT be updated to SCRIPT
+    mock_wf_repo.update_status.assert_not_awaited()
+    mock_job_repo.create_job.assert_not_awaited()

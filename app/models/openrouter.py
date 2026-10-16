@@ -58,9 +58,11 @@ class OpenRouterTextModel:
         prompt: str,
         *,
         system_prompt: str | None = None,
+        model_name: str | None = None,
     ) -> str:
         """Generate text from OpenRouter with structured logging, timeout, and normalized errors."""
         start_time = time.perf_counter()
+        target_model = model_name.strip() if model_name and model_name.strip() else self.model_name
         messages: list[dict[str, Any]] = []
 
         if system_prompt and system_prompt.strip():
@@ -70,7 +72,7 @@ class OpenRouterTextModel:
         try:
             response = await asyncio.wait_for(
                 self._client.chat.completions.create(
-                    model=self.model_name,
+                    model=target_model,
                     messages=messages,  # type: ignore[arg-type]
                 ),
                 timeout=self.timeout_seconds,
@@ -95,7 +97,7 @@ class OpenRouterTextModel:
             logger.info(
                 "model.generate",
                 provider="openrouter",
-                model=self.model_name,
+                model=target_model,
                 prompt_length=len(prompt),
                 duration_ms=round(duration_ms, 2),
                 success=True,

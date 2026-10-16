@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gates:
+    name: Quality Gates & Automated Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: videogen_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      VIDEOGEN_ENV: test
+      VIDEOGEN_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/videogen_test
+      VIDEOGEN_TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/videogen_test
+      VIDEOGEN_API_AUTH_TOKEN: ci-test-token-0123456789abcdef
+      VIDEOGEN_LOG_LEVEL: INFO
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install project and dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Verify linting (Ruff)
+        run: uv run ruff check .
+
+      - name: Verify code formatting (Ruff)
+        run: uv run ruff format --check .
+
+      - name: Compile bytecode & verify import sanity
+        run: uv run python -m compileall app
+
+      - name: Apply database migrations (Alembic)
+        run: uv run alembic upgrade head
+
+      - name: Verify schema parity (Alembic check)
+        run: uv run alembic check
+
+      - name: Run test suite with branch & statement coverage
+        run: uv run pytest --cov=app --cov-branch --cov-report=term-missing

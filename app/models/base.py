@@ -7,6 +7,7 @@ class TextModel(Protocol):
         prompt: str,
         *,
         system_prompt: str | None = None,
+        model_name: str | None = None,
     ) -> str:
         """Generate text from a model."""
         ...
